@@ -25,7 +25,6 @@ from typing import Mapping, Text, Tuple
 import torch
 from einops import rearrange
 from accelerate.utils.operations import gather
-from torch.cuda.amp import autocast
 
 class VectorQuantizer(torch.nn.Module):
     def __init__(self,
@@ -50,7 +49,7 @@ class VectorQuantizer(torch.nn.Module):
             self.register_buffer("embed_prob", torch.zeros(self.codebook_size))
 
     # Ensure quantization is performed using f32
-    @autocast(enabled=False)
+    @torch.autocast(device_type="cuda",enabled=False)
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, Mapping[Text, torch.Tensor]]:
         z = z.float()
         z = rearrange(z, 'b c h w -> b h w c').contiguous()
@@ -107,13 +106,13 @@ class VectorQuantizer(torch.nn.Module):
         z_quantized = z + (z_quantized - z).detach()
 
         # reshape back to match original input shape
-        z_quantized = rearrange(z_quantized, 'b h w c -> b c h w').contiguous()
+        z_quantized = rearrange(z_quantized, 'b h w c -> b c h w').contiguous() # B,D,1,N
 
         result_dict = dict(
             quantizer_loss=loss,
             commitment_loss=commitment_loss,
             codebook_loss=codebook_loss,
-            min_encoding_indices=min_encoding_indices.view(z_quantized.shape[0], z_quantized.shape[2], z_quantized.shape[3])
+            min_encoding_indices=min_encoding_indices.view(z_quantized.shape[0], z_quantized.shape[2], z_quantized.shape[3]) # B,1,N
         )
 
         return z_quantized, result_dict
@@ -128,10 +127,18 @@ class VectorQuantizer(torch.nn.Module):
         if self.use_l2_norm:
             z_quantized = torch.nn.functional.normalize(z_quantized, dim=-1)
         return z_quantized
-    
+
+    @torch.autocast(device_type='cuda', enabled=False)
+    def get_emb(self):
+        if self.use_l2_norm:
+            emb = torch.nn.functional.normalize(self.embedding.weight, dim=-1)
+        else:
+            emb = self.embedding.weight
+        assert emb.dtype == torch.float32, f"Embedding weight dtype is {emb.dtype}, expected float32"
+        return emb
 
 class DiagonalGaussianDistribution(object):
-    @autocast(enabled=False)
+    @torch.autocast(device_type="cuda",enabled=False)
     def __init__(self, parameters, deterministic=False):
         """Initializes a Gaussian distribution instance given the parameters.
 
@@ -151,16 +158,16 @@ class DiagonalGaussianDistribution(object):
         if self.deterministic:
             self.var = self.std = torch.zeros_like(self.mean).to(device=self.parameters.device)
 
-    @autocast(enabled=False)
+    @torch.autocast(device_type="cuda",enabled=False)
     def sample(self):
         x = self.mean.float() + self.std.float() * torch.randn(self.mean.shape).to(device=self.parameters.device)
         return x
 
-    @autocast(enabled=False)
+    @torch.autocast(device_type="cuda",enabled=False)
     def mode(self):
         return self.mean
 
-    @autocast(enabled=False)
+    @torch.autocast(device_type="cuda",enabled=False)
     def kl(self):
         if self.deterministic:
             return torch.Tensor([0.])
