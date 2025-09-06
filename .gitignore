@@ -187,15 +187,13 @@ titok3D_ll32_vae_run1/
 
 # wandb
 wandb/
-dataset/coinrun
 results/
 *.pyc
 temp_*/
 datasets/
-titok3D_*/
+titok_*/
 aaa_*/
 *.tar.gz
-past_experiments/
 slurm_output/
-archive/
 tokenizer*
+*.pth

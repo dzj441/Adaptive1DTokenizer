@@ -77,14 +77,17 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def create_pretrained_tokenizer(config, accelerator=None):
-    if config.model.vq_model.finetune_decoder:
-        # No need of pretrained tokenizer at stage2
-        pretrianed_tokenizer = None
+def create_pretrained_tokenizer(config, accelerator=None, deprecated = True):
+    if deprecated:
+        pretrianed_tokenizer = None # We no longer need pretrained tokenizer
     else:
-        pretrianed_tokenizer = PretrainedTokenizer(config.model.vq_model.pretrained_tokenizer_weight)
-        if accelerator is not None:
-            pretrianed_tokenizer.to(accelerator.device)
+        if config.model.vq_model.finetune_decoder:
+            # No need of pretrained tokenizer at stage2
+            pretrianed_tokenizer = None
+        else:
+            pretrianed_tokenizer = PretrainedTokenizer(config.model.vq_model.pretrained_tokenizer_weight)
+            if accelerator is not None:
+                pretrianed_tokenizer.to(accelerator.device)
     return pretrianed_tokenizer
 
 
@@ -104,7 +107,8 @@ def create_model_and_loss_module(config, logger, accelerator,
     logger.info("Creating model and loss module.")
     if model_type == "titok":
         model_cls = TiTok
-        loss_cls = ReconstructionLoss_Stage2 if config.model.vq_model.finetune_decoder else ReconstructionLoss_Stage1
+        # loss_cls = ReconstructionLoss_Stage2 if config.model.vq_model.finetune_decoder else ReconstructionLoss_Stage1
+        loss_cls = ReconstructionLoss_Stage2 # we no longer use stage1 proxy training
     elif model_type == "tatitok":
         model_cls = TATiTok
         loss_cls = ReconstructionLoss_Single_Stage
@@ -172,7 +176,9 @@ def create_model_and_loss_module(config, logger, accelerator,
         if model_type in ["titok"]:
             input_size = (1, 3, config.dataset.preprocessing.crop_size, config.dataset.preprocessing.crop_size)
             model_summary_str = summary(model, input_size=input_size, depth=5,
-            col_names=("input_size", "output_size", "num_params", "params_percent", "kernel_size", "mult_adds"))
+            col_names=("input_size", "output_size", "num_params", "params_percent", "kernel_size", "mult_adds"),
+            global_step=0,
+            max_steps=1)
             logger.info(model_summary_str)
         elif model_type in ["tatitok"]:
             input_image_size  = (1, 3, config.dataset.preprocessing.crop_size, config.dataset.preprocessing.crop_size)
@@ -225,24 +231,47 @@ def create_optimizer(config, logger, model, loss_module,
         optimizer_cls = AdamW
     else:
         raise ValueError(f"Optimizer {optimizer_type} not supported")
-
+    
+    if config.model.vq_model.use_prior_model:
+        prior_lr_mult = optimizer_config.get("prior_lr_mult") # prior model lr mult
+    
     # Exclude terms we may not want to apply weight decay.
     exclude = (lambda n, p: p.ndim < 2 or "ln" in n or "bias" in n or 'latent_tokens' in n 
                or 'mask_token' in n or 'embedding' in n or 'norm' in n or 'gamma' in n or 'embed' in n)
     include = lambda n, p: not exclude(n, p)
+    
     named_parameters = list(model.named_parameters())
-    gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
-    rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
+    nonprior_gain_or_bias_params, nonprior_rest_params = [], []
+    prior_gain_or_bias_params, prior_rest_params = [], []
+
+    for n, p in named_parameters:
+        if not p.requires_grad:
+            continue
+        is_prior = n.startswith("prior_model.")
+        if exclude(n, p):
+            (prior_gain_or_bias_params if is_prior else nonprior_gain_or_bias_params).append(p)
+        else:
+            (prior_rest_params if is_prior else nonprior_rest_params).append(p)
+
+    param_groups = []
+    # non prior（lr = base）
+    if nonprior_gain_or_bias_params:
+        param_groups.append({"params": nonprior_gain_or_bias_params, "weight_decay": 0., "lr": learning_rate})
+    if nonprior_rest_params:
+        param_groups.append({"params": nonprior_rest_params, "weight_decay": optimizer_config.weight_decay, "lr": learning_rate})
+    # prior（lr = base * mult）
+    if prior_gain_or_bias_params:
+        param_groups.append({"params": prior_gain_or_bias_params, "weight_decay": 0., "lr": learning_rate * prior_lr_mult})
+    if prior_rest_params:
+        param_groups.append({"params": prior_rest_params, "weight_decay": optimizer_config.weight_decay, "lr": learning_rate * prior_lr_mult})
+
     optimizer = optimizer_cls(
-        [
-            {"params": gain_or_bias_params, "weight_decay": 0.},
-            {"params": rest_params, "weight_decay": optimizer_config.weight_decay},
-        ],
+        param_groups,
         lr=learning_rate,
         betas=(optimizer_config.beta1, optimizer_config.beta2)
     )
 
-    if (config.model.vq_model.finetune_decoder or model_type == "tatitok") and need_discrminator:
+    if (not config.model.vq_model.finetune_decoder or model_type == "tatitok") and need_discrminator: # always need discrimnator
         discriminator_learning_rate = optimizer_config.discriminator_learning_rate
         discriminator_named_parameters = list(loss_module.named_parameters())
         discriminator_gain_or_bias_params = [p for n, p in discriminator_named_parameters if exclude(n, p) and p.requires_grad]
@@ -301,7 +330,7 @@ def create_dataloader(config, logger, accelerator):
     dataset_config = config.dataset.params
 
     # T2I uses a pretokenized dataset for speed-up.
-    if dataset_config.get("pretokenization", "") and dataset_config.get("dataset_with_text_label", False) is True:
+    if dataset_config.get("dataset_with_text_label", False) is True:
         dataset = PretokenizedWebDataset(
             train_shards_path=dataset_config.train_shards_path_or_url,
             eval_shards_path=dataset_config.eval_shards_path_or_url,
@@ -320,7 +349,7 @@ def create_dataloader(config, logger, accelerator):
         )
         train_dataloader, eval_dataloader = dataset.train_dataloader, dataset.eval_dataloader
     # SimpleImageDataset
-    elif dataset_config.get("pretokenization", "") and dataset_config.get("dataset_with_text_label", False) is False:
+    elif dataset_config.get("dataset_with_text_label", False) is False:
         dataset = SimpleImageDataset(
             train_shards_path=dataset_config.train_shards_path_or_url,
             eval_shards_path=dataset_config.eval_shards_path_or_url,
@@ -413,6 +442,7 @@ def train_one_epoch(config, logger, accelerator,
                     train_dataloader, eval_dataloader,
                     evaluator,
                     global_step,
+                    max_steps, # for prior loss
                     model_type="titok",
                     clip_tokenizer=None,
                     clip_encoder=None,
@@ -456,7 +486,7 @@ def train_one_epoch(config, logger, accelerator,
 
         with accelerator.accumulate([model, loss_module]):
             if model_type == "titok":
-                reconstructed_images, extra_results_dict = model(images)
+                reconstructed_images, extra_results_dict = model(images,global_step=global_step,max_steps=max_steps)
                 if proxy_codes is None:
                     autoencoder_loss, loss_dict = loss_module(
                         images,
@@ -514,7 +544,7 @@ def train_one_epoch(config, logger, accelerator,
 
             # Train discriminator.
             discriminator_logs = defaultdict(float)
-            if (config.model.vq_model.finetune_decoder or model_type == "tatitok") and accelerator.unwrap_model(loss_module).should_discriminator_be_trained(global_step):
+            if (not config.model.vq_model.finetune_decoder or model_type == "tatitok") and accelerator.unwrap_model(loss_module).should_discriminator_be_trained(global_step):
                 discriminator_logs = defaultdict(float)
                 discriminator_loss, loss_dict_discriminator = loss_module(
                     images,
@@ -571,6 +601,15 @@ def train_one_epoch(config, logger, accelerator,
                     f"Step: {global_step + 1} "
                     f"Total Loss: {autoencoder_logs['train/total_loss']:0.4f} "
                     f"Recon Loss: {autoencoder_logs['train/reconstruction_loss']:0.4f} "
+                    f"Percep Loss: {autoencoder_logs['train/perceptual_loss']:0.4f} "
+                    f"Quantizer Loss: {autoencoder_logs['train/quantizer_loss']:0.4f} "
+                    f"Commit Loss: {autoencoder_logs['train/commitment_loss']:0.4f} "
+                    f"Codebook Loss: {autoencoder_logs['train/codebook_loss']:0.4f} "
+                    f"GAN Loss: {autoencoder_logs['train/gan_loss']:0.4f} "
+                    f"W-GAN Loss: {autoencoder_logs['train/weighted_gan_loss']:0.4f} "
+                    f"Latent CE Loss: {autoencoder_logs['train/latent_ce_loss']:0.4f} "
+                    f"d_weight: {autoencoder_logs['train/d_weight']:0.4f} "
+                    f"D_factor: {autoencoder_logs['train/discriminator_factor']:0.4f} "
                 )
                 logs = {
                     "lr": lr,

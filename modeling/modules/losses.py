@@ -132,6 +132,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
         self.discriminator_weight = loss_config.discriminator_weight
         self.lecam_regularization_weight = loss_config.lecam_regularization_weight
         self.lecam_ema_decay = loss_config.get("lecam_ema_decay", 0.999)
+        self.loss_latent_ce_weight = loss_config.get("loss_latent_ce_weight",0.06)
         if self.lecam_regularization_weight > 0.0:
             self.register_buffer("ema_real_logits_mean", torch.zeros((1)))
             self.register_buffer("ema_fake_logits_mean", torch.zeros((1)))
@@ -195,11 +196,21 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
 
         # Compute quantizer loss.
         quantizer_loss = extra_result_dict["quantizer_loss"]
+        
+        # prior_loss
+        raw_latent_ce = extra_result_dict.get("loss_latent_ce", None)
+        latent_ce_loss = (
+            reconstruction_loss.new_tensor(0.0)
+            if raw_latent_ce is None
+            else raw_latent_ce
+        )
+
         total_loss = (
             reconstruction_loss
             + self.perceptual_weight * perceptual_loss
             + self.quantizer_weight * quantizer_loss
             + d_weight * discriminator_factor * generator_loss
+            + self.loss_latent_ce_weight * latent_ce_loss
         )
         loss_dict = dict(
             total_loss=total_loss.clone().detach(),
@@ -212,6 +223,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             codebook_loss=extra_result_dict["codebook_loss"].detach(),
             d_weight=d_weight,
             gan_loss=generator_loss.detach(),
+            latent_ce_loss=(self.loss_latent_ce_weight * latent_ce_loss).detach(),
         )
 
         return total_loss, loss_dict

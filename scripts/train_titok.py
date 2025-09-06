@@ -19,6 +19,8 @@ Reference:
 """
 import math
 import os
+import sys
+sys.path.append(os.getcwd())
 from pathlib import Path
 
 from accelerate.utils import set_seed
@@ -82,12 +84,12 @@ def main():
     if config.training.seed is not None:
         set_seed(config.training.seed, device_specific=True)
 
-    if accelerator.local_process_index == 0:
-        # download the maskgit-vq tokenizer weight
-        from huggingface_hub import hf_hub_download
-        hf_hub_download(repo_id="fun-research/TiTok", filename=f"{config.model.vq_model.pretrained_tokenizer_weight}", local_dir="./")
+    # if accelerator.local_process_index == 0:
+    #     # download the maskgit-vq tokenizer weight
+    #     from huggingface_hub import hf_hub_download
+    #     hf_hub_download(repo_id="fun-research/TiTok", filename=f"{config.model.vq_model.pretrained_tokenizer_weight}", local_dir="./")
         
-    accelerator.wait_for_everyone()
+    # accelerator.wait_for_everyone()
 
     pretrained_tokenizer = create_pretrained_tokenizer(config,
                                                        accelerator)
@@ -107,15 +109,11 @@ def main():
 
     # Prepare everything with accelerator.
     logger.info("Preparing model, optimizer and dataloaders")
+
     # The dataloader are already aware of distributed training, so we don't need to prepare them.
-    if config.model.vq_model.finetune_decoder:
-        model, loss_module, optimizer, discriminator_optimizer, lr_scheduler, discriminator_lr_scheduler = accelerator.prepare(
+    model, loss_module, optimizer, discriminator_optimizer, lr_scheduler, discriminator_lr_scheduler = accelerator.prepare(
             model, loss_module, optimizer, discriminator_optimizer, lr_scheduler, discriminator_lr_scheduler
-        )
-    else:
-        model, optimizer, lr_scheduler = accelerator.prepare(
-            model, optimizer, lr_scheduler
-        )
+    ) # always prepare 
     if config.training.use_ema:
         ema_model.to(accelerator.device)
 
@@ -149,7 +147,7 @@ def main():
                             lr_scheduler, discriminator_lr_scheduler,
                             train_dataloader, eval_dataloader,
                             evaluator,
-                            global_step,
+                            global_step,config.training.max_train_steps,
                             pretrained_tokenizer=pretrained_tokenizer)
         # Stop training if max steps is reached.
         if global_step >= config.training.max_train_steps:

@@ -265,7 +265,7 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
         # decoding
         decoded = self.decode(z_quantized)
         # prepare for prior loss
-        if self.quantize_mode == 'vq' and self.prior_model is not None:
+        if self.training and self.quantize_mode == 'vq' and self.use_prior_model:
             min_encoding_indices = result_dict["min_encoding_indices"] # [B,1,N] # assert VQ
             B, D, H, W = z_quantized.shape  # H==1, W==N
             assert z_quantized.dim() == 4, "z_quantized must be 4D (B, D, H=1, W=N)" # fake 2D shape
@@ -371,13 +371,15 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
                 # we can not use "with torch.no_grad()" here due to a pytorch's bug!
                 # https://github.com/pytorch/pytorch/issues/112583
                 prior_model.requires_grad_(False)
-                prior_model_output = prior_model.ar_predict(next_ar_input.detach()) # (b, n - 1, codebook_size) # 阻挡梯度 只算最后一轮
-                logits, ar_pred_cont = self.calculate_logits_and_ar_pred_cont(prior_model_output)
+                with torch.amp.autocast("cuda", enabled=False):
+                    prior_model_output = prior_model.ar_predict(next_ar_input.detach().float())
+                    logits, ar_pred_cont = self.calculate_logits_and_ar_pred_cont(prior_model_output.float())
                 prior_model.requires_grad_(True)
             else:
-                prior_model_output = prior_model.ar_predict(next_ar_input) # (b, n - 1, codebook_size) or (b, n, d=16) # 第0个
-                logits, ar_pred_cont = self.calculate_logits_and_ar_pred_cont(prior_model_output) # logits；对码本的未归一化打分，表示改选哪个code softmax后变成概率
-                logits_all_rounds.append(logits)
+                with torch.amp.autocast("cuda", enabled=False):
+                    prior_model_output = prior_model.ar_predict(next_ar_input.float()) # (b, n - 1, codebook_size) or (b, n, d=16) # 第0个
+                    logits, ar_pred_cont = self.calculate_logits_and_ar_pred_cont(prior_model_output.float()) # logits；对码本的未归一化打分，表示改选哪个code softmax后变成概率
+                    logits_all_rounds.append(logits)
 
 
             if i < n_rounds - 1:
@@ -392,6 +394,25 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
 
         return logits_all_rounds, ar_pred_cont, next_ar_input # here the next_ar_input is actually the last round's ar_input
 
+    def prior_parameters(self, require_grad_only: bool = True):
+        """return prior model parameters"""
+        pm = getattr(self, "prior_model", None)
+        if pm is None:
+            return []
+        params = list(pm.parameters())
+        if require_grad_only:
+            params = [p for p in params if p.requires_grad]
+        return params
+
+    def non_prior_parameters(self, require_grad_only: bool = True):
+        """return parameters other than prior_model"""
+        params = []
+        for name, p in self.named_parameters():
+            if not name.startswith("prior_model."):
+                if (not require_grad_only) or p.requires_grad:
+                    params.append(p)
+        return params
+    
 @torch.no_grad()
 @torch.autocast(device_type='cuda', enabled=False)
 def calculate_topk_accuracy(logits, targets, topk=(1, 5), prepend=''):
@@ -421,7 +442,7 @@ def calculate_topk_accuracy(logits, targets, topk=(1, 5), prepend=''):
     topk_accuracies = {}
     for k in topk:
         correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-        topk_accuracies[f'{prepend}top{k}_acc'] = correct_k.mul_(100.0 / batch_size).item()
+        topk_accuracies[f'{prepend}top{k}_acc'] = correct_k.mul_(100.0 / batch_size)
 
     return topk_accuracies
 
@@ -447,7 +468,7 @@ if __name__ == "__main__":
             print(f"{name}: {val} ({type(val).__name__})")
 
     # 1) Load config from YAML
-    cfg_path_str = r"configs\training\adaptive1DTokenzier\titok_bl32_vq.yaml"
+    cfg_path_str = r"configs/training/adaptive1DTokenzier/titok_bl32_vq.yaml"
     if not (cfg_path_str.lower().endswith(".yml") or cfg_path_str.lower().endswith(".yaml")):
         print(f"[Error] Not a YAML file: {cfg_path_str}")
         sys.exit(1)

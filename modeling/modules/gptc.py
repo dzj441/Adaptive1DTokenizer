@@ -161,7 +161,7 @@ class GPTC(nn.Module):
     def compute_prior_loss(self, x: torch.Tensor) -> torch.Tensor:
         # x: (b, n, n_ind) 
         if self.l2_normalized:
-            x = F.normalize(x, p=2, dim=-1)
+            x = F.normalize(x, p=2, dim=-1,eps=1e-12)
             
         target = x[:, 1:]
         if self.detach_target:
@@ -183,7 +183,7 @@ class GPTC(nn.Module):
         full_pred = torch.cat([x[:, :1], pred], dim=1) # (b, n, n_ind)
 
         if self.l2_normalized:
-            full_pred = F.normalize(full_pred, p=2, dim=-1)
+            full_pred = F.normalize(full_pred, p=2, dim=-1,eps=1e-12)
         return full_pred
     
 
