@@ -133,6 +133,9 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
         self.lecam_regularization_weight = loss_config.lecam_regularization_weight
         self.lecam_ema_decay = loss_config.get("lecam_ema_decay", 0.999)
         self.loss_latent_ce_weight = loss_config.get("loss_latent_ce_weight",0.06)
+
+        self.disc_input_shift = loss_config.get("disc_input_shift", False)
+
         if self.lecam_regularization_weight > 0.0:
             self.register_buffer("ema_real_logits_mean", torch.zeros((1)))
             self.register_buffer("ema_fake_logits_mean", torch.zeros((1)))
@@ -157,7 +160,12 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             return self._forward_discriminator(inputs, reconstructions, global_step)
         else:
             raise ValueError(f"Unsupported mode {mode}")
-   
+    
+    def _disc_preproc(self, x: torch.Tensor) -> torch.Tensor:
+        if self.disc_input_shift:
+            return x * 2.0 - 1.0
+        return x
+       
     def should_discriminator_be_trained(self, global_step : int):
         return global_step >= self.discriminator_iter_start
 
@@ -189,7 +197,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             # Disable discriminator gradients.
             for param in self.discriminator.parameters():
                 param.requires_grad = False
-            logits_fake = self.discriminator(reconstructions)
+            logits_fake = self.discriminator(self._disc_preproc(reconstructions))
             generator_loss = -torch.mean(logits_fake)
 
         d_weight *= self.discriminator_weight
@@ -240,9 +248,12 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
         for param in self.discriminator.parameters():
             param.requires_grad = True
 
-        real_images = inputs.detach().requires_grad_(True)
+        real_images = self._disc_preproc(inputs.detach())
+        real_images.requires_grad_(True) 
+        fake_images = self._disc_preproc(reconstructions.detach())
+
         logits_real = self.discriminator(real_images)
-        logits_fake = self.discriminator(reconstructions.detach())
+        logits_fake = self.discriminator(fake_images)
 
         discriminator_loss = discriminator_factor * hinge_d_loss(logits_real=logits_real, logits_fake=logits_fake)
 

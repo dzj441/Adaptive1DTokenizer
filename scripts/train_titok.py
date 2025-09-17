@@ -110,10 +110,11 @@ def main():
     # Prepare everything with accelerator.
     logger.info("Preparing model, optimizer and dataloaders")
 
-    # The dataloader are already aware of distributed training, so we don't need to prepare them.
-    model, loss_module, optimizer, discriminator_optimizer, lr_scheduler, discriminator_lr_scheduler = accelerator.prepare(
-            model, loss_module, optimizer, discriminator_optimizer, lr_scheduler, discriminator_lr_scheduler
-    ) # always prepare 
+    model, loss_module, optimizer, discriminator_optimizer,lr_scheduler, discriminator_lr_scheduler,train_dataloader, eval_dataloader = \
+        accelerator.prepare(model, loss_module, optimizer, discriminator_optimizer,
+        lr_scheduler, discriminator_lr_scheduler,train_dataloader, eval_dataloader)
+
+    # always prepare dataloader
     if config.training.use_ema:
         ema_model.to(accelerator.device)
 

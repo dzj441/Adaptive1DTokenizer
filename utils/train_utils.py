@@ -24,7 +24,7 @@ import glob
 from collections import defaultdict
 import open_clip
 
-from data import SimpleImageDataset, PretoeknizedDataSetJSONL, PretokenizedWebDataset
+from data import SimpleImageDataset, PretoeknizedDataSetJSONL, PretokenizedWebDataset,SimpleImageFolderDataset
 import torch
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
@@ -319,63 +319,115 @@ def create_lr_scheduler(config, logger, accelerator, optimizer, discriminator_op
 def create_dataloader(config, logger, accelerator):
     """Creates data loader for training and testing."""
     logger.info("Creating dataloaders.")
-    total_batch_size_without_accum = config.training.per_gpu_batch_size * accelerator.num_processes
-    total_batch_size = (
-        config.training.per_gpu_batch_size * accelerator.num_processes * config.training.gradient_accumulation_steps
+
+    total_batch_size_without_accum = (
+        config.training.per_gpu_batch_size * accelerator.num_processes
     )
-    # We use webdataset for data loading. The dataloaders are created with sampling with replacement.
-    # We don't do dataset resuming here, instead we resample the shards and buffer each time. The sampling is stochastic.
-    # This means that the dataloading is not deterministic, but it's fast and efficient.
+    total_batch_size = (
+        config.training.per_gpu_batch_size
+        * accelerator.num_processes
+        * config.training.gradient_accumulation_steps
+    )
+
     preproc_config = config.dataset.preprocessing
     dataset_config = config.dataset.params
+    ds_format = str(getattr(config.dataset, "format", "wds")).lower()
 
-    # T2I uses a pretokenized dataset for speed-up.
-    if dataset_config.get("dataset_with_text_label", False) is True:
-        dataset = PretokenizedWebDataset(
-            train_shards_path=dataset_config.train_shards_path_or_url,
-            eval_shards_path=dataset_config.eval_shards_path_or_url,
-            num_train_examples=config.experiment.max_train_examples,
+    # Default return placeholders
+    train_dataloader = None
+    eval_dataloader = None
+
+
+    if ds_format == "local":
+        # We switch to the ImageFolder implementation.
+        # Expected fields in config.dataset.params:
+        #   - train_dir: path to ImageFolder training root
+        #   - eval_dir : path to ImageFolder validation root
+        #
+        # Transforms are controlled by preprocessing:
+        #   - resize_shorter_edge, crop_size, random_crop, random_flip,
+        #   - normalize_mean (optional), normalize_std (optional)
+
+        if not hasattr(dataset_config, "train_dir") or not hasattr(dataset_config, "eval_dir"):
+            raise ValueError(
+                "When dataset.format == 'local', you must provide "
+                "`train_dir` and `eval_dir` under config.dataset.params."
+            )
+
+
+        dataset = SimpleImageFolderDataset(
+            train_dir=dataset_config.train_dir,
+            eval_dir=dataset_config.eval_dir,
             per_gpu_batch_size=config.training.per_gpu_batch_size,
-            global_batch_size=total_batch_size_without_accum,
             num_workers_per_gpu=dataset_config.num_workers_per_gpu,
             resize_shorter_edge=preproc_config.resize_shorter_edge,
             crop_size=preproc_config.crop_size,
             random_crop=preproc_config.random_crop,
             random_flip=preproc_config.random_flip,
-            normalize_mean=preproc_config.normalize_mean,
-            normalize_std=preproc_config.normalize_std,
-            process_recap=preproc_config.get("preproc_recap", True),
-            use_recap_prob=preproc_config.get("use_recap_prob", 0.95)
+            # optional normalization (defaults keep [0,1])
+            normalize_mean=getattr(preproc_config, "normalize_mean", [0.0, 0.0, 0.0]),
+            normalize_std=getattr(preproc_config, "normalize_std", [1.0, 1.0, 1.0]),
         )
         train_dataloader, eval_dataloader = dataset.train_dataloader, dataset.eval_dataloader
-    # SimpleImageDataset
-    elif dataset_config.get("dataset_with_text_label", False) is False:
-        dataset = SimpleImageDataset(
-            train_shards_path=dataset_config.train_shards_path_or_url,
-            eval_shards_path=dataset_config.eval_shards_path_or_url,
-            num_train_examples=config.experiment.max_train_examples,
-            per_gpu_batch_size=config.training.per_gpu_batch_size,
-            global_batch_size=total_batch_size_without_accum,
-            num_workers_per_gpu=dataset_config.num_workers_per_gpu,
-            resize_shorter_edge=preproc_config.resize_shorter_edge,
-            crop_size=preproc_config.crop_size,
-            random_crop=preproc_config.random_crop,
-            random_flip=preproc_config.random_flip,
-            dataset_with_class_label=dataset_config.get("dataset_with_class_label", True),
-            dataset_with_text_label=dataset_config.get("dataset_with_text_label", False),
-            res_ratio_filtering=preproc_config.get("res_ratio_filtering", False),
-        )
-        train_dataloader, eval_dataloader = dataset.train_dataloader, dataset.eval_dataloader
-    # potentially, use a pretokenized dataset for ImageNet speed-up.
+
     else:
-        if dataset_config.get("pretokenization", ""):
-            train_dataloader = DataLoader(
-                PretoeknizedDataSetJSONL(dataset_config.pretokenization),
-                batch_size=config.training.per_gpu_batch_size,
-                shuffle=True, drop_last=True, pin_memory=True)
-            train_dataloader.num_batches = math.ceil(
-                config.experiment.max_train_examples / total_batch_size_without_accum)
-    
+        # T2I uses a pretokenized dataset for speed-up.
+        if dataset_config.get("dataset_with_text_label", False) is True:
+            # Pretokenized text-image WebDataset
+            dataset = PretokenizedWebDataset(
+                train_shards_path=dataset_config.train_shards_path_or_url,
+                eval_shards_path=dataset_config.eval_shards_path_or_url,
+                num_train_examples=config.experiment.max_train_examples,
+                per_gpu_batch_size=config.training.per_gpu_batch_size,
+                global_batch_size=total_batch_size_without_accum,
+                num_workers_per_gpu=dataset_config.num_workers_per_gpu,
+                resize_shorter_edge=preproc_config.resize_shorter_edge,
+                crop_size=preproc_config.crop_size,
+                random_crop=preproc_config.random_crop,
+                random_flip=preproc_config.random_flip,
+                normalize_mean=getattr(preproc_config, "normalize_mean", [0.0, 0.0, 0.0]),
+                normalize_std=getattr(preproc_config, "normalize_std", [1.0, 1.0, 1.0]),
+                process_recap=preproc_config.get("preproc_recap", True),
+                use_recap_prob=preproc_config.get("use_recap_prob", 0.95),
+            )
+            train_dataloader, eval_dataloader = dataset.train_dataloader, dataset.eval_dataloader
+
+        # SimpleImageDataset: class-label WebDataset (original branch)
+        elif dataset_config.get("dataset_with_text_label", False) is False:
+            dataset = SimpleImageDataset(
+                train_shards_path=dataset_config.train_shards_path_or_url,
+                eval_shards_path=dataset_config.eval_shards_path_or_url,
+                num_train_examples=config.experiment.max_train_examples,
+                per_gpu_batch_size=config.training.per_gpu_batch_size,
+                global_batch_size=total_batch_size_without_accum,
+                num_workers_per_gpu=dataset_config.num_workers_per_gpu,
+                resize_shorter_edge=preproc_config.resize_shorter_edge,
+                crop_size=preproc_config.crop_size,
+                random_crop=preproc_config.random_crop,
+                random_flip=preproc_config.random_flip,
+                # keep original flags for WDS branch (even if no-op for class-label)
+                dataset_with_class_label=dataset_config.get("dataset_with_class_label", True),
+                dataset_with_text_label=dataset_config.get("dataset_with_text_label", False),
+                res_ratio_filtering=preproc_config.get("res_ratio_filtering", False),
+            )
+            train_dataloader, eval_dataloader = dataset.train_dataloader, dataset.eval_dataloader
+
+        # Potentially, use a pretokenized dataset for ImageNet speed-up (original fallback).
+        else:
+            if dataset_config.get("pretokenization", ""):
+                train_dataloader = DataLoader(
+                    PretoeknizedDataSetJSONL(dataset_config.pretokenization),
+                    batch_size=config.training.per_gpu_batch_size,
+                    shuffle=True,
+                    drop_last=True,
+                    pin_memory=True,
+                )
+                # Attach convenience meta; not used by training control flow.
+                import math
+                train_dataloader.num_batches = math.ceil(
+                    config.experiment.max_train_examples / total_batch_size_without_accum
+                )
+
     return train_dataloader, eval_dataloader
 
 
@@ -523,6 +575,15 @@ def train_one_epoch(config, logger, accelerator,
                         autoencoder_logs["train/" + k] = v
                 else:
                     autoencoder_logs["train/" + k] = accelerator.gather(v).mean().item()
+
+            for m in ("prior_top1_acc", "prior_top5_acc"):
+                # prior related
+                v = extra_results_dict.get(m, None)
+                if v is None:
+                    continue
+                if not isinstance(v, torch.Tensor):
+                    v = torch.tensor(v, device=images.device, dtype=torch.float32)
+                autoencoder_logs[f"train/{m}"] = accelerator.gather(v).mean().item()
 
             accelerator.backward(autoencoder_loss)
 

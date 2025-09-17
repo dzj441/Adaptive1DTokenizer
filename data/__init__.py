@@ -1,1 +1,2 @@
 from .webdataset_reader import SimpleImageDataset, PretoeknizedDataSetJSONL,PretokenizedWebDataset
+from .imgnet1k_dataset import SimpleImageFolderDataset
