@@ -7,7 +7,9 @@ from torchvision.datasets import ImageFolder
 from torchvision import transforms
 from PIL import Image
 
+from PIL import ImageFile
 
+ImageFile.LOAD_TRUNCATED_IMAGES = True # tolerate truncated images
 Image.MAX_IMAGE_PIXELS = None  # keep consistent behavior
 
 

@@ -54,8 +54,8 @@ losses:
 dataset:
     format: "local"
     params:
-        train_dir: "ImageNet/data/train"
-        eval_dir: "ImageNet/data/val"
+        train_dir: "ImageNet/train"
+        eval_dir: "ImageNet/val"
         # train_shards_path_or_url: "ImageNet_wds/val/imagenet-val-{0000..0009}.tar"
         # eval_shards_path_or_url: "ImageNet_wds/val/imagenet-val-0010.tar"
         num_workers_per_gpu: 12

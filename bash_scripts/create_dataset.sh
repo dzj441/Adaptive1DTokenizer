@@ -1,0 +1,1 @@
+ln -s /datasets01/imagenet_full_size/061417 ./ImageNet

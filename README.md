@@ -7,7 +7,10 @@ bash bash_scripts/create_env.sh
 ```
 ## dataset
 recommend using symbolic link  
-dataset format should be
+```
+bash bash_scripts/create_dataset.sh
+```
+dataset format should be  
 ```
 path/to/trainset
                 /n01440764
@@ -22,6 +25,7 @@ path/to/valset
                         /many_pics.JPEG
                 ......
 ```
+> make sure that valset also follows ImageFolder protocal
 ## training
 train a no prior loss version  
 ```
