@@ -36,7 +36,7 @@ from utils.train_utils import (
     create_optimizer, create_lr_scheduler, create_dataloader,
     create_evaluator, auto_resume, save_checkpoint, 
     train_one_epoch)
-
+import wandb
 
 def main():
     workspace = os.environ.get('WORKSPACE', '')
@@ -60,6 +60,7 @@ def main():
     if config.training.enable_wandb:
         tracker = "wandb"
 
+
     accelerator = Accelerator(
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
         mixed_precision=config.training.mixed_precision,
@@ -73,8 +74,24 @@ def main():
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
+
     if accelerator.is_main_process:
-        accelerator.init_trackers(config.experiment.name)
+        api_key = os.environ.get("WANDB_API_KEY")
+        if api_key:
+            wandb.login(key=api_key)
+        else:
+            KEY = "0022f2e7631e0264b23083ff83e6d0ca32ebb89e"
+            wandb.login(key=KEY) # login
+
+        accelerator.init_trackers(
+            config.experiment.project,  
+            config=OmegaConf.to_container(config, resolve=True),  
+            init_kwargs={
+                "wandb": {
+                    "name": config.experiment.name 
+                }
+            }
+        )
         config_path = Path(output_dir) / "config.yaml"
         logger.info(f"Saving config to {config_path}")
         OmegaConf.save(config, config_path)
