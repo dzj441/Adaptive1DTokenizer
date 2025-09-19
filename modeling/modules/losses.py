@@ -28,7 +28,7 @@ from torch.cuda.amp import autocast
 from modeling.diffusion import create_diffusion
 from modeling.modules.blocks import SimpleMLPAdaLN
 from .perceptual_loss import PerceptualLoss
-from .discriminator import NLayerDiscriminator,DINODiscriminator
+from .discriminator import NLayerDiscriminator
 
 
 def hinge_d_loss(logits_real: torch.Tensor, logits_fake: torch.Tensor) -> torch.Tensor:
@@ -118,6 +118,8 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
         """
         super().__init__()
         loss_config = config.losses
+        self.discriminator = NLayerDiscriminator()
+
         self.reconstruction_loss = loss_config.reconstruction_loss
         self.reconstruction_weight = loss_config.reconstruction_weight
         self.quantizer_weight = loss_config.quantizer_weight
@@ -132,21 +134,6 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
         self.lecam_ema_decay = loss_config.get("lecam_ema_decay", 0.999)
         self.loss_latent_ce_weight = loss_config.get("loss_latent_ce_weight",0.06)
 
-        self.discriminator_type = loss_config.get("discriminator_type", "patchGAN") # (DINOv2) discriminator or NLayerDiscriminator.
-        self.tokenwise = loss_config.get("tokenwise", False) # If True, compute GAN losses in a token/patch-wise manner before averaging.
-        self.r1_gamma = loss_config.get("r1gp_gamma", 0.0)  # R1 regularization coefficient; 0.0 disables R1.
-        # Discriminator setup 
-        if self.discriminator_type == "dino":
-            self.discriminator = DINODiscriminator(
-                c_dim=0,
-                diffaug=getattr(loss_config, "disc_diffaug", False),
-                p_crop=0.5,
-                hooks=[2, 5, 8, 11],
-                hook_patch=True,
-                dinov2_name=getattr(loss_config, "dinov2_name", "vit_small_patch14_dinov2.lvd142m"),
-            )
-        else:
-            self.discriminator = NLayerDiscriminator()
         self.disc_input_shift = loss_config.get("disc_input_shift", False)
 
         if self.lecam_regularization_weight > 0.0:
@@ -155,62 +142,6 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
 
         self.config = config
 
-    @staticmethod
-    def _flatten_logits(logits: torch.Tensor) -> torch.Tensor:
-        """Flatten logits to [B, N] so losses can be unified for [B,1,H,W] and [B,T]."""
-        if logits.ndim == 1:
-            return logits.unsqueeze(1)
-        B = logits.size(0)
-        return logits.view(B, -1)
-
-    def _reduce_scores(self, logits: torch.Tensor, tokenwise: bool) -> torch.Tensor:
-        """Return [B, N] if tokenwise; otherwise average over tokens to [B]."""
-        flat = self._flatten_logits(logits)  # [B, N]
-        return flat if tokenwise else flat.mean(dim=1)  # [B,N] or [B]
-
-    def _g_hinge_loss(self, logits_fake: torch.Tensor) -> torch.Tensor:
-        """Generator hinge: -E[D(fake)] in either tokenwise or averaged mode."""
-        f = self._reduce_scores(logits_fake, self.tokenwise)
-        return (-f).mean()
-
-    def _d_hinge_loss(self, logits_real: torch.Tensor, logits_fake: torch.Tensor) -> torch.Tensor:
-        """Discriminator hinge with optional tokenwise mode."""
-        r = self._reduce_scores(logits_real, self.tokenwise)
-        f = self._reduce_scores(logits_fake, self.tokenwise)
-        loss_real = F.relu(1.0 - r).mean()
-        loss_fake = F.relu(1.0 + f).mean()
-        return 0.5 * (loss_real + loss_fake)
-
-    def _r1_penalty(self, real_images: torch.Tensor) -> torch.Tensor:
-        """R1 = (gamma/2) * E[||∇_x D(x)||^2]; applied on real images only."""
-        if self.r1_gamma <= 0.0:
-            return real_images.new_zeros(())
-        
-        # Ensure input requires grad
-        real_images.requires_grad_(True)
-
-        # Forward through discriminator
-        logits_real = self.discriminator(real_images)
-
-        # Always reduce to scalar mean to avoid unused gradient issues
-        s = self._reduce_scores(logits_real, self.tokenwise).mean()
-        # Compute gradients w.r.t. real images
-        grads = torch.autograd.grad(
-            outputs=s,
-            inputs=real_images,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-
-        # Defensive fallback: if grads is None, return zero penalty
-        # if grads is None:
-        #     return real_images.new_zeros(())
-
-        grads = grads.view(grads.size(0), -1)
-        grad_norm2 = (grads ** 2).sum(dim=1)
-        return (self.r1_gamma / 2.0) * grad_norm2.mean()
-    
     @autocast(enabled=False)
     def forward(self,
                 inputs: torch.Tensor,
@@ -267,7 +198,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             for param in self.discriminator.parameters():
                 param.requires_grad = False
             logits_fake = self.discriminator(self._disc_preproc(reconstructions))
-            generator_loss = self._g_hinge_loss(logits_fake)
+            generator_loss = -torch.mean(logits_fake)
 
         d_weight *= self.discriminator_weight
 
@@ -317,50 +248,34 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
         for param in self.discriminator.parameters():
             param.requires_grad = True
 
-        real_images = self._disc_preproc(inputs)
+        real_images = self._disc_preproc(inputs.detach())
         real_images.requires_grad_(True) 
         fake_images = self._disc_preproc(reconstructions.detach())
 
         logits_real = self.discriminator(real_images)
         logits_fake = self.discriminator(fake_images)
 
-        # Hinge (tokenwise or averaged depending on flag)
-        discriminator_loss = discriminator_factor * self._d_hinge_loss(
-            logits_real=logits_real, logits_fake=logits_fake
-        )
-
-        # Optional R1 (real only, discriminator step only)
-        # Record the numeric value even when disabled (as 0) for stable logging.
-        r1_val = torch.zeros((), device=inputs.device)
-        if self.r1_gamma > 0.0:
-            r1_term = self._r1_penalty(real_images)   # scalar tensor
-            r1_val = r1_term.detach()
-            discriminator_loss = discriminator_loss + r1_term
+        discriminator_loss = discriminator_factor * hinge_d_loss(logits_real=logits_real, logits_fake=logits_fake)
 
         # optional lecam regularization
         lecam_loss = torch.zeros((), device=inputs.device)
         if self.lecam_regularization_weight > 0.0:
-            # Use unified reduction for EMA to be consistent across different D outputs.
-            real_mean = self._reduce_scores(logits_real, tokenwise=False).mean()
-            fake_mean = self._reduce_scores(logits_fake, tokenwise=False).mean()
-
             lecam_loss = compute_lecam_loss(
-                real_mean,
-                fake_mean,
+                torch.mean(logits_real),
+                torch.mean(logits_fake),
                 self.ema_real_logits_mean,
                 self.ema_fake_logits_mean
             ) * self.lecam_regularization_weight
 
-            self.ema_real_logits_mean = self.ema_real_logits_mean * self.lecam_ema_decay + real_mean.detach()  * (1 - self.lecam_ema_decay)
-            self.ema_fake_logits_mean = self.ema_fake_logits_mean * self.lecam_ema_decay + fake_mean.detach()  * (1 - self.lecam_ema_decay)
+            self.ema_real_logits_mean = self.ema_real_logits_mean * self.lecam_ema_decay + torch.mean(logits_real).detach()  * (1 - self.lecam_ema_decay)
+            self.ema_fake_logits_mean = self.ema_fake_logits_mean * self.lecam_ema_decay + torch.mean(logits_fake).detach()  * (1 - self.lecam_ema_decay)
         
         discriminator_loss += lecam_loss
 
         loss_dict = dict(
             discriminator_loss=discriminator_loss.detach(),
-            logits_real=self._reduce_scores(logits_real, tokenwise=False).mean().detach(),
-            logits_fake=self._reduce_scores(logits_fake, tokenwise=False).mean().detach(),
-            r1_penalty=r1_val,
+            logits_real=logits_real.detach().mean(),
+            logits_fake=logits_fake.detach().mean(),
             lecam_loss=lecam_loss.detach(),
         )
         return discriminator_loss, loss_dict
@@ -551,83 +466,3 @@ class DiffLoss(nn.Module):
         )
 
         return sampled_token_latent
-
-if __name__ == "__main__":
-    import torch
-    import torch.nn.functional as F
-    from omegaconf import OmegaConf
-
-    # ---------------------------
-    # 1) Load config (edit the path to your yaml)
-    # ---------------------------
-    cfg_path = r"configs\training\adaptive1DTokenzier\titok_bl128_vq_prior_dino_debug.yaml"  # <-- 替换成你的 YAML 路径
-    config = OmegaConf.load(cfg_path)
-
-    # ---------------------------
-    # 2) Instantiate the loss module
-    # ---------------------------
-    loss_module = ReconstructionLoss_Stage2(config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    loss_module.to(device)
-
-    # ---------------------------
-    # 3) Build dummy batch for unit test
-    #    - inputs / reconstructions: [B,3,256,256], in [0,1]
-    #    - extra_result_dict: required keys for the loss
-    # ---------------------------
-    torch.manual_seed(0)
-    B, C, H, W = 4, 3, 256, 256
-    inputs = torch.rand(B, C, H, W, device=device)
-    # make recon a slightly noised version of inputs (still in [0,1])
-    reconstructions = (inputs + 0.05 * torch.randn_like(inputs)).clamp(0.0, 1.0)
-
-    # quantizer-related scalars the loss expects
-    extra_result_dict = {
-        "quantizer_loss": torch.tensor(0.12, device=device),
-        "commitment_loss": torch.tensor(0.08, device=device),
-        "codebook_loss": torch.tensor(0.04, device=device),
-        # optional prior loss (if present it will be used)
-        "loss_latent_ce": torch.tensor(0.02, device=device),
-    }
-
-    # Pick a global_step so that discriminator branch is active
-    global_step = int(config.losses.get("discriminator_start", 0))
-
-    # ---------------------------
-    # 4) Forward: generator step
-    # ---------------------------
-    total_loss_g, loss_dict_g = loss_module(
-        inputs=inputs,
-        reconstructions=reconstructions,
-        extra_result_dict=extra_result_dict,
-        global_step=global_step,
-        mode="generator",
-    )
-
-    print("\n[Generator step]")
-    print("total_loss:", float(total_loss_g.detach().cpu()))
-    for k, v in loss_dict_g.items():
-        # print scalars only to keep output clean
-        try:
-            print(f"  {k}: {float(v.detach().cpu())}")
-        except Exception:
-            print(f"  {k}: (non-scalar)")
-
-    # ---------------------------
-    # 5) Forward: discriminator step
-    # ---------------------------
-    total_loss_d, loss_dict_d = loss_module(
-        inputs=inputs,
-        reconstructions=reconstructions,
-        extra_result_dict=extra_result_dict,
-        global_step=global_step,
-        mode="discriminator",
-    )
-
-    print("\n[Discriminator step]")
-    print("discriminator_loss:", float(total_loss_d.detach().cpu()))
-    for k, v in loss_dict_d.items():
-        try:
-            print(f"  {k}: {float(v.detach().cpu())}")
-        except Exception:
-            print(f"  {k}: (non-scalar)")
