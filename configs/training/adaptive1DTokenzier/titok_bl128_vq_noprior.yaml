@@ -3,7 +3,7 @@ experiment:
     name: "titok_bl32_vq_run1"
     output_dir: "titok_bl32_vq_run1"
     max_train_examples: 1_281_167
-    save_every: 50_000
+    save_every: 25_000
     eval_every: 25_000
     generate_every: 1000
     log_every: 50
