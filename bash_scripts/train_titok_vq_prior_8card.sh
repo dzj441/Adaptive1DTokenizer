@@ -1,3 +1,5 @@
+source activate TiTok
+
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7\
 WANDB_API_KEY=0022f2e7631e0264b23083ff83e6d0ca32ebb89e\
 WANDB_MODE=online\
