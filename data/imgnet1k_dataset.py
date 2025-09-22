@@ -1,17 +1,37 @@
 from typing import List, Optional, Tuple
 from pathlib import Path
+import time,os
 
 import torch
 from torch.utils.data import DataLoader, DistributedSampler, default_collate
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from PIL import ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True # tolerate truncated images
 Image.MAX_IMAGE_PIXELS = None  # keep consistent behavior
 
+def robust_loader(path: str,
+                  max_trials: int = 3,
+                  base_delay: float = 0.25) -> Image.Image:
+
+    last = None
+    for k in range(max_trials):
+        try:
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            with open(path, "rb") as f:
+                img = Image.open(f)
+                return img.convert("RGB")
+        except (FileNotFoundError, OSError, UnidentifiedImageError) as e:
+            last = e
+            if k == max_trials - 1:
+                break
+            delay = base_delay * (2 ** k)
+            time.sleep(delay)
+    raise last
 
 def is_distributed_initialized() -> bool:
     """Return True only if torch.distributed is initialized."""
@@ -77,28 +97,28 @@ class ImageFolderWithFilename(ImageFolder):
     Returned item: (image_tensor, class_idx, filename_str)
     """
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int, str]:
-        image, target = super().__getitem__(index)
+    
+    def __getitem__(self, index: int) -> Optional[Tuple[torch.Tensor, int, str]]:
+        try:
+            image, target = super().__getitem__(index)
+        except (FileNotFoundError, OSError, UnidentifiedImageError):
+            # true error
+            return None
         path, _ = self.samples[index]  # (path, class_idx)
         filename = Path(path).name
         return image, target, filename
 
 
+
 def _collate_to_dict(batch):
-    """
-    Collate a list of (image, class_id, filename) into a dict (WebDataset-like):
-      {
-        "image": FloatTensor[B, 3, H, W],
-        "class_id": LongTensor[B],
-        "filename": List[str],   # filename with extension
-        "__key__": List[str],    # key-like id; here we use filename stem to mimic WDS '__key__'
-      }
-    """
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None # bad batch
     images, targets, filenames = zip(*batch)
     images = default_collate(images)
     class_ids = torch.as_tensor(targets, dtype=torch.long)
     filenames = list(filenames)
-    keys = [Path(fn).stem for fn in filenames]  # mimic WebDataset '__key__'
+    keys = [Path(fn).stem for fn in filenames]
     return {
         "image": images,
         "class_id": class_ids,
@@ -139,7 +159,7 @@ class SimpleImageFolderDataset:
         normalize_mean: List[float] = [0.0, 0.0, 0.0],
         normalize_std: List[float] = [1.0, 1.0, 1.0],
         pin_memory: bool = True,
-        persistent_workers: bool = True,
+        persistent_workers: bool = False,
         drop_last_train: bool = True,
     ):
         self.train_dir = Path(train_dir)
@@ -161,10 +181,12 @@ class SimpleImageFolderDataset:
         self._train_dataset = ImageFolderWithFilename(
             root=str(self.train_dir),
             transform=self.transforms.train_transform,
+            loader=robust_loader,
         )
         self._eval_dataset = ImageFolderWithFilename(
             root=str(self.eval_dir),
             transform=self.transforms.eval_transform,
+            loader=robust_loader,
         )
 
         # ====== DataLoaders ======
