@@ -510,15 +510,6 @@ def train_one_epoch(config, logger, accelerator,
     discriminator_logs = defaultdict(float)
     for i, batch in enumerate(train_dataloader):
         model.train()
-        local_has_data = 0 if batch is None else 1
-        # gather all process
-        has_data_all = accelerator.gather(torch.tensor([local_has_data], device=accelerator.device))
-        # any rank has empty batch
-        if has_data_all.sum().item() != accelerator.num_processes:
-            # skip this step for all rank to sync step
-            accelerator.wait_for_everyone()
-            continue
-
         if "image" in batch:
             images = batch["image"].to(
                 accelerator.device, memory_format=torch.contiguous_format, non_blocking=True
