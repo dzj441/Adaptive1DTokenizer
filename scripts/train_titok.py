@@ -48,8 +48,8 @@ def main():
     if config.training.enable_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
     output_dir = config.experiment.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -76,22 +76,34 @@ def main():
     # The trackers initializes automatically on the main process.
 
     if accelerator.is_main_process:
-        api_key = os.environ.get("WANDB_API_KEY")
-        if api_key:
-            wandb.login(key=api_key)
-        else:
-            KEY = "0022f2e7631e0264b23083ff83e6d0ca32ebb89e"
-            wandb.login(key=KEY) # login
+    #     api_key = os.environ.get("WANDB_API_KEY")
+    #     if api_key:
+    #         wandb.login(key=api_key)
+    #     else:
+    #         KEY = "0022f2e7631e0264b23083ff83e6d0ca32ebb89e"
+    #         wandb.login(key=KEY) # login
+
+        resolved_config_dict = OmegaConf.to_container(config, resolve=True)
+        # key logs
+        hparams_to_log = {
+            "exp_name": resolved_config_dict["experiment"]["name"], 
+            "vq_vit_enc_model_size": resolved_config_dict["model"]["vq_model"]["vit_enc_model_size"],
+            "vq_vit_dec_model_size": resolved_config_dict["model"]["vq_model"]["vit_dec_model_size"],
+            "vq_num_latent_tokens": resolved_config_dict["model"]["vq_model"]["num_latent_tokens"],
+            "optim_learning_rate": resolved_config_dict["optimizer"]["params"]["learning_rate"],
+            "train_per_gpu_batch_size": resolved_config_dict["training"]["per_gpu_batch_size"],
+        }
 
         accelerator.init_trackers(
-            config.experiment.project,  
-            config=OmegaConf.to_container(config, resolve=True),  
+            config.experiment.project,
+            config=hparams_to_log, 
             init_kwargs={
                 "wandb": {
-                    "name": config.experiment.name 
+                    "name": config.experiment.name
                 }
             }
         )
+    
         config_path = Path(output_dir) / "config.yaml"
         logger.info(f"Saving config to {config_path}")
         OmegaConf.save(config, config_path)
@@ -100,6 +112,7 @@ def main():
     # If passed along, set the training seed now.
     if config.training.seed is not None:
         set_seed(config.training.seed, device_specific=True)
+        os.environ["PYTHONHASHSEED"] = str(config.training.seed)
 
     # if accelerator.local_process_index == 0:
     #     # download the maskgit-vq tokenizer weight

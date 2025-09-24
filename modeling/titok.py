@@ -151,7 +151,8 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
                 codebook_size=config.model.vq_model.codebook_size,
                 token_size=config.model.vq_model.token_size,
                 commitment_cost=config.model.vq_model.commitment_cost,
-                use_l2_norm=config.model.vq_model.use_l2_norm,)
+                use_l2_norm=config.model.vq_model.use_l2_norm,
+                clustering_vq=config.model.vq_model.clustering_vq)
         elif self.quantize_mode == "vae":
             self.quantize = DiagonalGaussianDistribution
         else:
