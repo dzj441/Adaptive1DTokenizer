@@ -1,0 +1,14 @@
+source activate TiTok
+
+CUDA_VISIBLE_DEVICES=0,1\
+# WANDB_API_KEY=0022f2e7631e0264b23083ff83e6d0ca32ebb89e\
+# WANDB_MODE=online\
+# WANDB_PROJECT=titok_bl128_vq\
+# WANDB_NAME=titok_bl128_vq_8card_noPrior\ 
+accelerate launch \
+  --num_machines=1 \
+  --num_processes=2 \
+  --machine_rank=0 scripts/train_titok.py config=configs/training/adaptive1DTokenzier/debug_everything.yaml \
+    experiment.project="debug" \
+    experiment.name="debug" \
+    experiment.output_dir="titok_bl128_debug" \

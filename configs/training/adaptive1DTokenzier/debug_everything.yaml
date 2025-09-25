@@ -3,11 +3,11 @@ experiment:
     name: "titok_bl32_vq_run1"
     output_dir: "titok_bl32_vq_run1"
     max_train_examples: 1_281_167
-    save_every: 50_000
-    eval_every: 25_000
-    generate_every: 1000
-    log_every: 50
-    log_grad_norm_every: 500
+    save_every: 50
+    eval_every: 50
+    generate_every: 50
+    log_every: 10
+    log_grad_norm_every: 50
     resume: True
 
 model:
@@ -16,7 +16,7 @@ model:
         quantize_mode: vq
         codebook_size: 8192
         token_size: 12
-        use_l2_norm: True
+        use_l2_norm: Tr`ue
         commitment_cost: 0.25
         clustering_vq: True
         # vit arch
@@ -37,11 +37,11 @@ model:
         no_grad_before_last_round: false
         no_dropout: false
         latent_ce_temperature: 1.0
-        l2_normalized: true    
+        l2_normalized: true  
         prior_token_sampling_policy: "greedy"
 
 losses:
-    discriminator_start: 150_000
+    discriminator_start: 100
     quantizer_weight: 1.0
     discriminator_factor: 1.0
     discriminator_weight: 0.1
@@ -78,7 +78,7 @@ lr_scheduler:
     scheduler: "cosine"
     params:
         learning_rate: ${optimizer.params.learning_rate}
-        warmup_steps: 10_000
+        warmup_steps: 10
         end_lr: 1e-5
 
 training:
@@ -89,6 +89,6 @@ training:
     enable_wandb: False
     use_ema: True
     seed: 42
-    max_train_steps: 500_000
+    max_train_steps: 200
     num_generated_images: 2
     max_grad_norm: 1.0

@@ -30,13 +30,13 @@ from accelerate.utils.operations import gather
 from accelerate.state import AcceleratorState
 
 
-def _safe_gather(x, dim=0):
+def _safe_gather(x):
     state = AcceleratorState()
     if state.num_processes == 1:
         return x
     else:
-        return gather(x, dim=dim)
-    
+        return gather(x) 
+
 class VectorQuantizer(nn.Module):
     def __init__(
         self,

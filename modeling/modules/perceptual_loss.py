@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License. 
 """
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -26,7 +27,9 @@ _IMAGENET_STD = [0.229, 0.224, 0.225]
 
  
 class PerceptualLoss(torch.nn.Module):
-    def __init__(self, model_name: str = "convnext_s"):
+    def __init__(self, 
+                 model_name: str = "convnext_s",
+                 convnext_small_path: str = "./weights/convnext_small-0c510722.pth"):
         """Initializes the PerceptualLoss class.
 
         Args:
@@ -54,7 +57,15 @@ class PerceptualLoss(torch.nn.Module):
             self.lpips = LPIPS().eval()
 
         if "convnext_s" in model_name:
-            self.convnext = models.convnext_small(weights=models.ConvNeXt_Small_Weights.IMAGENET1K_V1).eval()
+            base_convnext = models.convnext_small(weights=None)
+            if not os.path.exists(convnext_small_path):
+                raise FileNotFoundError(
+                    f"ConvNeXt-Small weights not found at {convnext_small_path}. "
+                    f"Please download 'convnext_small-0c510722.pth' to this location."
+                )
+            state_dict = torch.load(convnext_small_path, map_location="cpu")
+            base_convnext.load_state_dict(state_dict)
+            self.convnext = base_convnext.eval()
 
         if "lpips" in model_name and "convnext_s" in model_name:
             loss_config = model_name.split('-')[-2:]
@@ -103,14 +114,14 @@ class PerceptualLoss(torch.nn.Module):
                 pred_input,
                 pred_target,
                 reduction="mean")
-                
+
             if self.loss_weight_convnext is None:
                 num_losses += 1
                 loss += convnext_loss
             else:
                 num_losses += self.loss_weight_convnext
                 loss += self.loss_weight_convnext * convnext_loss
-        
+
         # weighted avg.
         loss = loss / num_losses
         return loss

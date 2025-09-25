@@ -46,7 +46,7 @@ def download(url, local_path, chunk_size=1024):
                 for data in r.iter_content(chunk_size=chunk_size):
                     if data:
                         f.write(data)
-                        pbar.update(chunk_size)
+                        pbar.update(len(data))
 
 
 def md5_hash(path):
@@ -72,19 +72,30 @@ class LPIPS(nn.Module):
         super().__init__()
         self.scaling_layer = ScalingLayer()
         self.chns = [64, 128, 256, 512, 512]  # vg16 features
-        self.net = vgg16(pretrained=True, requires_grad=False)
+        # Pass the path for ImageNet VGG16 weights
+        self.net = vgg16(pretrained=True, requires_grad=False, 
+                         imagenet_vgg16_path="./weights/vgg16-397923af.pth")
         self.lin0 = NetLinLayer(self.chns[0], use_dropout=use_dropout)
         self.lin1 = NetLinLayer(self.chns[1], use_dropout=use_dropout)
         self.lin2 = NetLinLayer(self.chns[2], use_dropout=use_dropout)
         self.lin3 = NetLinLayer(self.chns[3], use_dropout=use_dropout)
         self.lin4 = NetLinLayer(self.chns[4], use_dropout=use_dropout)
-        self.load_pretrained()
+        # Use the default local path for LPIPS's vgg.pth
+        self.load_pretrained(ckpt_path="./weights/vgg.pth")
         for param in self.parameters():
             param.requires_grad = False
 
-    def load_pretrained(self):
-        workspace = os.environ.get('WORKSPACE', '')
-        VGG_PATH = get_ckpt_path("vgg_lpips", os.path.join(workspace, "models/vgg_lpips.pth"), check=True)
+    def load_pretrained(self, ckpt_path: str = "./weights/vgg.pth"):
+        VGG_PATH = ckpt_path
+
+        if not os.path.exists(VGG_PATH): # download
+            print(f"{VGG_PATH} not found, downloading from {URL_MAP['vgg_lpips']} ...")
+            os.makedirs(os.path.dirname(VGG_PATH), exist_ok=True)
+            download(URL_MAP["vgg_lpips"], VGG_PATH)
+            md5 = md5_hash(VGG_PATH)
+            assert md5 == MD5_MAP["vgg_lpips"], f"MD5 mismatch: expected {MD5_MAP['vgg_lpips']}, got {md5}"
+
+        print(f"Loading LPIPS weights from {VGG_PATH}")
         self.load_state_dict(torch.load(VGG_PATH, map_location=torch.device("cpu")), strict=False)
 
     def forward(self, input, target):
@@ -136,9 +147,24 @@ class NetLinLayer(nn.Module):
 
 
 class vgg16(torch.nn.Module):
-    def __init__(self, requires_grad=False, pretrained=True):
+    def __init__(self, requires_grad=False, pretrained=True, imagenet_vgg16_path: str = "./weights/vgg16-397923af.pth"):
         super(vgg16, self).__init__()
-        vgg_pretrained_features = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
+        
+        # Build VGG16 architecture without loading online weights
+        base_vgg = models.vgg16(weights=None)
+
+        if pretrained:
+            if not os.path.exists(imagenet_vgg16_path):
+                raise FileNotFoundError(
+                    f"ImageNet VGG16 weights not found at {imagenet_vgg16_path}. "
+                    f"Please download 'vgg16-397923af.pth' to this location."
+                )
+            # Load local ImageNet VGG16 weights
+            state_dict = torch.load(imagenet_vgg16_path, map_location="cpu")
+            base_vgg.load_state_dict(state_dict)
+            
+        vgg_pretrained_features = base_vgg.features
+
         self.slice1 = torch.nn.Sequential()
         self.slice2 = torch.nn.Sequential()
         self.slice3 = torch.nn.Sequential()

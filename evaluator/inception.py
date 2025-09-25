@@ -19,6 +19,7 @@ Reference:
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os # Added for os.path.exists
 import torch
 import torch.nn.functional as F
 
@@ -34,7 +35,7 @@ except ImportError:
 
 
 # Note: Compared shasum and models should be the same.
-FID_WEIGHTS_URL = 'https://github.com/mseitzer/pytorch-fid/releases/download/fid_weights/pt_inception-2015-12-05-6726825d.pth'
+# FID_WEIGHTS_URL = 'https://github.com/mseitzer/pytorch-fid/releases/download/fid_weights/pt_inception-2015-12-05-6726825d.pth' # Removed this for local loading
 
 class FeatureExtractorInceptionV3(FeatureExtractorBase):
     INPUT_IMAGE_SIZE = 299
@@ -43,6 +44,7 @@ class FeatureExtractorInceptionV3(FeatureExtractorBase):
             self,
             name,
             features_list,
+            local_weights_path: str = "./weights/pt_inception-2015-12-05-6726825d.pth", # Added local_weights_path
             **kwargs,
     ):
         """
@@ -92,8 +94,13 @@ class FeatureExtractorInceptionV3(FeatureExtractorBase):
 
         self.fc = torch.nn.Linear(2048, 1008)
 
-        state_dict = load_state_dict_from_url(FID_WEIGHTS_URL, progress=True)
-        #state_dict = torch.load(FID_WEIGHTS_URL, map_location='cpu')
+        # Load from local path instead of URL
+        if not os.path.exists(local_weights_path):
+            raise FileNotFoundError(
+                f"InceptionV3 weights not found at {local_weights_path}. "
+                f"Please download 'pt_inception-2015-12-05-6726825d.pth' to this location."
+            )
+        state_dict = torch.load(local_weights_path, map_location='cpu')
         self.load_state_dict(state_dict)
 
         self.to(self.feature_extractor_internal_dtype)
@@ -226,6 +233,7 @@ class FeatureExtractorInceptionV3(FeatureExtractorBase):
     def get_dummy_input_for_compile():
         return (torch.rand([1, 3, 4, 4]) * 255).to(torch.uint8)
 
-def get_inception_model():
-    model = FeatureExtractorInceptionV3("inception_model", ["2048", "logits_unbiased"])
+def get_inception_model(local_weights_path: str = "./weights/pt_inception-2015-12-05-6726825d.pth"): # Added local_weights_path
+    # Pass the local_weights_path to FeatureExtractorInceptionV3
+    model = FeatureExtractorInceptionV3("inception_model", ["2048", "logits_unbiased"], local_weights_path=local_weights_path)
     return model
