@@ -240,12 +240,18 @@ class TiTokEncoder(nn.Module):
                 "large": 16,
             }[self.model_size]
         
+        self.use_semantic_guidance = config.model.vq_model.get("use_semantic_guidance",False)
+        if self.use_semantic_guidance:
+            self.semantic_guidance_dim = config.model.semantic_encoder.token_dim
+            self.semantic_proj = nn.Linear(self.semantic_guidance_dim, self.width, bias=True)
+             
         self.patch_embed = nn.Conv2d(
             in_channels=3, out_channels=self.width,
               kernel_size=self.patch_size, stride=self.patch_size, bias=True)
         
         scale = self.width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(1, self.width))
+        if not self.use_semantic_guidance: # use DINO cls instead if use semantic guidance
+            self.class_embedding = nn.Parameter(scale * torch.randn(1, self.width))
         self.positional_embedding = nn.Parameter(
                 scale * torch.randn(self.grid_size ** 2 + 1, self.width))
         self.latent_token_positional_embedding = nn.Parameter(
@@ -259,14 +265,19 @@ class TiTokEncoder(nn.Module):
         self.ln_post = nn.LayerNorm(self.width)
         self.conv_out = nn.Conv2d(self.width, self.token_size, kernel_size=1, bias=True)
 
-    def forward(self, pixel_values, latent_tokens):
+    def forward(self, pixel_values, latent_tokens, semantic_token_dict):
         batch_size = pixel_values.shape[0]
         x = pixel_values
         x = self.patch_embed(x)
         x = x.reshape(x.shape[0], x.shape[1], -1)
         x = x.permute(0, 2, 1) # shape = [*, grid ** 2, width]
         # class embeddings and positional embeddings
-        x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
+        if self.use_semantic_guidance:
+            semantic_cls = semantic_token_dict['x_norm_clstoken'].detach()   # [B, D_teacher]
+            cls_token = self.semantic_proj(semantic_cls).unsqueeze(1).to(x.dtype)  # [B,1,width]
+        else:
+            cls_token = _expand_token(self.class_embedding, batch_size).to(x.dtype)
+        x = torch.cat([cls_token, x], dim=1)
         x = x + self.positional_embedding.to(x.dtype) # shape = [*, grid ** 2 + 1, width]
         
 
@@ -352,6 +363,10 @@ class TiTokDecoder(nn.Module):
                 Rearrange('b (p1 p2 c) h w -> b c (h p1) (w p2)',
                     p1 = self.patch_size, p2 = self.patch_size),)
             self.conv_out = nn.Conv2d(3, 3, 3, padding=1, bias=True)
+        self.use_semantic_guidance = config.model.vq_model.get("use_semantic_guidance", False)
+        if self.use_semantic_guidance:
+            self.semantic_guidance_dim = config.model.semantic_encoder.token_dim
+            self.cls_out = nn.Linear(self.width, self.semantic_guidance_dim, bias=True)            
     
     def forward(self, z_quantized):
         N, C, H, W = z_quantized.shape
@@ -373,13 +388,18 @@ class TiTokDecoder(nn.Module):
         for i in range(self.num_layers):
             x = self.transformer[i](x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        x = x[:, 1:1+self.grid_size**2] # remove cls embed
         x = self.ln_post(x)
+
+        cls_token = x[:, 0]  # decoder cls
+        x = x[:, 1:1+self.grid_size**2] # remove cls embed
         # N L D -> N D H W
         x = x.permute(0, 2, 1).reshape(batchsize, self.width, self.grid_size, self.grid_size)
         x = self.ffn(x.contiguous())
         x = self.conv_out(x)
-        return x
+        cls_recon = None
+        if self.use_semantic_guidance:
+            cls_recon = self.cls_out(cls_token)  # [B, D_semantic]            
+        return x,cls_recon
 
 
 class TATiTokDecoder(TiTokDecoder):

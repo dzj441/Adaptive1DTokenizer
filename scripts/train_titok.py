@@ -31,7 +31,7 @@ from omegaconf import OmegaConf
 from utils.logger import setup_logger
 
 from utils.train_utils import (
-    get_config, create_pretrained_tokenizer, 
+    get_config, create_pretrained_tokenizer, create_semantic_encoder,
     create_model_and_loss_module,
     create_optimizer, create_lr_scheduler, create_dataloader,
     create_evaluator, auto_resume, save_checkpoint, 
@@ -75,13 +75,13 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
 
-    if accelerator.is_main_process:
-    #     api_key = os.environ.get("WANDB_API_KEY")
-    #     if api_key:
-    #         wandb.login(key=api_key)
-    #     else:
-    #         KEY = "0022f2e7631e0264b23083ff83e6d0ca32ebb89e"
-    #         wandb.login(key=KEY) # login
+    if accelerator.is_main_process and config.training.enable_wandb:
+        api_key = os.environ.get("WANDB_API_KEY")
+        if api_key:
+            wandb.login(key=api_key)
+        else:
+            KEY = "0022f2e7631e0264b23083ff83e6d0ca32ebb89e"
+            wandb.login(key=KEY) # login
 
         resolved_config_dict = OmegaConf.to_container(config, resolve=True)
         # key logs
@@ -123,6 +123,7 @@ def main():
 
     pretrained_tokenizer = create_pretrained_tokenizer(config,
                                                        accelerator)
+    semantic_encoder = create_semantic_encoder(config)
 
     model, ema_model, loss_module = create_model_and_loss_module(
         config, logger, accelerator, model_type="titok")
@@ -140,8 +141,8 @@ def main():
     # Prepare everything with accelerator.
     logger.info("Preparing model, optimizer and dataloaders")
 
-    model, loss_module, optimizer, discriminator_optimizer,lr_scheduler, discriminator_lr_scheduler,train_dataloader, eval_dataloader = \
-        accelerator.prepare(model, loss_module, optimizer, discriminator_optimizer,
+    model, semantic_encoder,loss_module, optimizer, discriminator_optimizer,lr_scheduler, discriminator_lr_scheduler,train_dataloader, eval_dataloader = \
+        accelerator.prepare(model, semantic_encoder, loss_module, optimizer, discriminator_optimizer,
         lr_scheduler, discriminator_lr_scheduler,train_dataloader, eval_dataloader)
 
     # always prepare dataloader
@@ -179,7 +180,8 @@ def main():
                             train_dataloader, eval_dataloader,
                             evaluator,
                             global_step,config.training.max_train_steps,
-                            pretrained_tokenizer=pretrained_tokenizer)
+                            pretrained_tokenizer=pretrained_tokenizer,
+                            semantic_encoder = semantic_encoder)
         # Stop training if max steps is reached.
         if global_step >= config.training.max_train_steps:
             accelerator.print(

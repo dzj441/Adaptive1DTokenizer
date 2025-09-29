@@ -1,4 +1,4 @@
-name: TiTok
+name: TiTok310
 channels:
   - defaults
 dependencies:
@@ -14,7 +14,7 @@ dependencies:
   - ncurses=6.5
   - openssl=3.0.17
   - pthread-stubs=0.3
-  - python=3.9.18
+  - python=3.10
   - readline=8.3
   - setuptools=78.1.1
   - sqlite=3.50.2
@@ -108,13 +108,13 @@ dependencies:
       - sympy==1.14.0
       - termcolor==3.1.0
       - timm==1.0.19
-      - tokenizers==0.20.3
+      - tokenizers==0.22.1
       - torch==2.8.0
       - torch-fidelity==0.3.0
       - torchinfo==1.8.0
       - torchvision==0.23.0
       - tqdm==4.67.1
-      - transformers==4.46.2
+      - transformers==4.56.2
       - triton==3.4.0
       - typing-extensions==4.15.0
       - typing-inspection==0.4.1
@@ -127,3 +127,5 @@ dependencies:
       - yarl==1.20.1
       - zipp==3.23.0
       - tensorboard==2.20.0
+      - xformers==0.0.32.post2
+      - clip==0.2.0

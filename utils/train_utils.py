@@ -31,6 +31,7 @@ from omegaconf import OmegaConf
 from torch.optim import AdamW
 from utils.lr_schedulers import get_scheduler
 from modeling.modules import EMAModel, ReconstructionLoss_Stage1, ReconstructionLoss_Stage2, ReconstructionLoss_Single_Stage, MLMLoss, ARLoss
+from modeling.semantic_encoder import PretrainedSemanticEncoder
 from modeling.titok import TiTok, PretrainedTokenizer
 from modeling.tatitok import TATiTok
 from modeling.maskgit import ImageBert, UViTBert
@@ -90,6 +91,16 @@ def create_pretrained_tokenizer(config, accelerator=None, deprecated = True):
                 pretrianed_tokenizer.to(accelerator.device)
     return pretrianed_tokenizer
 
+def create_semantic_encoder(config, resolution=256):
+    use_semantic = config.model.vq_model.get("use_semantic_guidance",False)
+    if use_semantic:
+        if resolution not in (256, 512):
+            raise ValueError(f"resolution must be 256 or 512,but get {resolution}")
+        enc_type = config.model.semantic_encoder.enc_type
+        semantic_encoder = PretrainedSemanticEncoder(enc_type=enc_type, resolution=resolution)
+    else:
+        semantic_encoder = None
+    return semantic_encoder
 
 def create_clip_model():
     clip, _, _ = open_clip.create_model_and_transforms('ViT-L-14-336', pretrained='openai')
@@ -174,11 +185,36 @@ def create_model_and_loss_module(config, logger, accelerator,
     # Print Model for sanity check.
     if accelerator.is_main_process:
         if model_type in ["titok"]:
-            input_size = (1, 3, config.dataset.preprocessing.crop_size, config.dataset.preprocessing.crop_size)
-            model_summary_str = summary(model, input_size=input_size, depth=5,
-            col_names=("input_size", "output_size", "num_params", "params_percent", "kernel_size", "mult_adds"),
-            global_step=0,
-            max_steps=1)
+            B = 1
+            H = W = config.dataset.preprocessing.crop_size
+            device = next(model.parameters()).device
+            dtype  = next(model.parameters()).dtype
+            x = torch.randn(B, 3, H, W, device=device, dtype=dtype)
+            if config.model.vq_model.get("use_semantic_guidance", False):
+                D = int(config.model.semantic_encoder.token_dim)
+                semantic_token_dict = {
+                    "x_norm_clstoken": torch.randn(B, D, device=device, dtype=dtype)
+                    # "x_norm_registertokens": torch.randn(B, R, D, device=device, dtype=dtype),
+                    # "x_norm_patchtokens":    torch.randn(B, N, D, device=device, dtype=dtype),
+                }
+                model_summary_str = summary(
+                    model,
+                    input_data={"x": x, "semantic_token_dict": semantic_token_dict},
+                    depth=5,
+                    col_names=("input_size", "output_size", "num_params", "params_percent", "kernel_size", "mult_adds"),
+                    global_step=0,
+                    max_steps=1,
+                )
+            else:
+                # 不用语义引导时仍可用 input_size（或同样用 input_data={"x": x}）
+                model_summary_str = summary(
+                    model,
+                    input_data={"x": x},
+                    depth=5,
+                    col_names=("input_size", "output_size", "num_params", "params_percent", "kernel_size", "mult_adds"),
+                    global_step=0,
+                    max_steps=1,
+                )
             logger.info(model_summary_str)
         elif model_type in ["tatitok"]:
             input_image_size  = (1, 3, config.dataset.preprocessing.crop_size, config.dataset.preprocessing.crop_size)
@@ -498,7 +534,8 @@ def train_one_epoch(config, logger, accelerator,
                     model_type="titok",
                     clip_tokenizer=None,
                     clip_encoder=None,
-                    pretrained_tokenizer=None):
+                    pretrained_tokenizer=None,
+                    semantic_encoder=None):
     """One epoch training."""
     batch_time_meter = AverageMeter()
     data_time_meter = AverageMeter()
@@ -535,10 +572,18 @@ def train_one_epoch(config, logger, accelerator,
             proxy_codes = pretrained_tokenizer.encode(images)
         else:
             proxy_codes = None
+        
+        if semantic_encoder is not None:
+            semantic_encoder.eval()
+            semantic_token_dict = semantic_encoder.forward_features(images) # returns a dict of {'x_norm_clstoken': cls,'x_norm_patchtokens': patch_token,'x_norm_registertokens': possible regs}
+        else:
+            semantic_token_dict = None
 
         with accelerator.accumulate([model, loss_module]):
             if model_type == "titok":
-                reconstructed_images, extra_results_dict = model(images,global_step=global_step,max_steps=max_steps)
+                reconstructed_images, extra_results_dict = model(images,semantic_token_dict,global_step=global_step,max_steps=max_steps)
+                if semantic_token_dict is not None:
+                    extra_results_dict.update(semantic_token_dict)
                 if proxy_codes is None:
                     autoencoder_loss, loss_dict = loss_module(
                         images,
@@ -669,6 +714,7 @@ def train_one_epoch(config, logger, accelerator,
                     f"GAN Loss: {autoencoder_logs['train/gan_loss']:0.4f} "
                     f"W-GAN Loss: {autoencoder_logs['train/weighted_gan_loss']:0.4f} "
                     f"Latent CE Loss: {autoencoder_logs['train/latent_ce_loss']:0.4f} "
+                    f"cls L2 Loss: {autoencoder_logs['train/semantic_cls_loss']:0.4f} "
                     f"d_weight: {autoencoder_logs['train/d_weight']:0.4f} "
                     f"D_factor: {autoencoder_logs['train/discriminator_factor']:0.4f} "
                 )
@@ -695,7 +741,8 @@ def train_one_epoch(config, logger, accelerator,
                 accelerator.wait_for_everyone()
 
             # Generate images.
-            if (global_step + 1) % config.experiment.generate_every == 0 and accelerator.is_main_process:
+            if (global_step + 1) % config.experiment.generate_every == 0 and accelerator.is_main_process \
+                and config.training.num_generated_images > 0:
                 # Store the model parameters temporarily and load the EMA parameters to perform inference.
                 if config.training.get("use_ema", False):
                     ema_model.store(model.parameters())
@@ -712,7 +759,8 @@ def train_one_epoch(config, logger, accelerator,
                     config=config,
                     model_type=model_type,
                     text_guidance=text_guidance[:config.training.num_generated_images] if model_type == "tatitok" else None,
-                    pretrained_tokenizer=pretrained_tokenizer
+                    pretrained_tokenizer=pretrained_tokenizer,
+                    semantic_encoder=semantic_encoder
                 )
 
                 if config.training.get("use_ema", False):
@@ -735,7 +783,8 @@ def train_one_epoch(config, logger, accelerator,
                         model_type=model_type,
                         clip_tokenizer=clip_tokenizer,
                         clip_encoder=clip_encoder,
-                        pretrained_tokenizer=pretrained_tokenizer
+                        pretrained_tokenizer=pretrained_tokenizer,
+                        semantic_encoder=semantic_encoder
                     )
                     logger.info(
                         f"EMA EVALUATION "
@@ -758,7 +807,8 @@ def train_one_epoch(config, logger, accelerator,
                         model_type=model_type,
                         clip_tokenizer=clip_tokenizer,
                         clip_encoder=clip_encoder,
-                        pretrained_tokenizer=pretrained_tokenizer
+                        pretrained_tokenizer=pretrained_tokenizer,
+                        semantic_encoder=semantic_encoder
                     )
 
                     logger.info(
@@ -1120,7 +1170,8 @@ def eval_reconstruction(
     model_type="titok",
     clip_tokenizer=None,
     clip_encoder=None,
-    pretrained_tokenizer=None
+    pretrained_tokenizer=None,
+    semantic_encoder=None
 ):
     model.eval()
     evaluator.reset_metrics()
@@ -1144,7 +1195,9 @@ def eval_reconstruction(
 
         original_images = torch.clone(images)
         if model_type == "titok":
-            reconstructed_images, model_dict = local_model(images)
+            if semantic_encoder is not None:
+                semantic_feats = semantic_encoder.forward_features(images)
+            reconstructed_images, model_dict = local_model(images,semantic_feats)
         elif model_type == "tatitok":
             reconstructed_images, model_dict = local_model(images, text_guidance)
         else:
@@ -1172,7 +1225,7 @@ def eval_reconstruction(
 def reconstruct_images(model, original_images, fnames, accelerator, 
                     global_step, output_dir, logger, config=None,
                     model_type="titok", text_guidance=None, 
-                    pretrained_tokenizer=None):
+                    pretrained_tokenizer=None, semantic_encoder=None):
     logger.info("Reconstructing images...")
     original_images = torch.clone(original_images)
     model.eval()
@@ -1181,12 +1234,13 @@ def reconstruct_images(model, original_images, fnames, accelerator,
         dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         dtype = torch.bfloat16
-
+    if semantic_encoder is not None:
+        semantic_feats = semantic_encoder.forward_features(original_images)    
     with torch.autocast("cuda", dtype=dtype, enabled=accelerator.mixed_precision != "no"):
-        enc_tokens, encoder_dict = accelerator.unwrap_model(model).encode(original_images)
+        enc_tokens, encoder_dict = accelerator.unwrap_model(model).encode(original_images,semantic_feats)
     
     if model_type == "titok":
-        reconstructed_images = accelerator.unwrap_model(model).decode(enc_tokens)
+        reconstructed_images,_ = accelerator.unwrap_model(model).decode(enc_tokens)
     elif model_type == "tatitok":
         reconstructed_images = accelerator.unwrap_model(model).decode(enc_tokens, text_guidance)
     if pretrained_tokenizer is not None:

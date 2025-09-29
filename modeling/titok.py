@@ -85,7 +85,7 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
         self.config = config
         # This should be False for stage1 and True for stage2.
         self.finetune_decoder = config.model.vq_model.get("finetune_decoder", True)
-
+        self.use_semantic_guidance = config.model.vq_model.get("use_semantic_guidance", False)
         self.use_prior_model = config.model.vq_model.get("use_prior_model", False)
         self.quantize_mode = config.model.vq_model.get("quantize_mode", "vq")
         if self.quantize_mode not in ["vq", "vae"]:
@@ -151,8 +151,7 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
                 codebook_size=config.model.vq_model.codebook_size,
                 token_size=config.model.vq_model.token_size,
                 commitment_cost=config.model.vq_model.commitment_cost,
-                use_l2_norm=config.model.vq_model.use_l2_norm,
-                clustering_vq=config.model.vq_model.clustering_vq)
+                use_l2_norm=config.model.vq_model.use_l2_norm,)
         elif self.quantize_mode == "vae":
             self.quantize = DiagonalGaussianDistribution
         else:
@@ -212,7 +211,7 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
     def dtype(self):
         return next(self.parameters()).dtype
     
-    def encode(self, x):
+    def encode(self, x, semantic_token_dict):
         if self.finetune_decoder:
             with torch.no_grad():
                 self.encoder.eval()
@@ -223,7 +222,7 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
                 result_dict["commitment_loss"] *= 0
                 result_dict["codebook_loss"] *= 0
         else:
-            z = self.encoder(pixel_values=x, latent_tokens=self.latent_tokens)
+            z = self.encoder(pixel_values=x, latent_tokens=self.latent_tokens,semantic_token_dict = semantic_token_dict)
             if self.quantize_mode == "vq":
                 z_quantized, result_dict = self.quantize(z)
             elif self.quantize_mode == "vae":
@@ -234,13 +233,13 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
         return z_quantized, result_dict
     
     def decode(self, z_quantized):
-        decoded = self.decoder(z_quantized)
+        decoded,cls_reconsturcted = self.decoder(z_quantized)
         if self.finetune_decoder:
             quantized_states = torch.einsum(
                 'nchw,cd->ndhw', decoded.softmax(1),
                 self.pixel_quantize.embedding.weight)
             decoded = self.pixel_decoder(quantized_states)
-        return decoded
+        return decoded,cls_reconsturcted
     
     def decode_tokens(self, tokens):
         if self.quantize_mode == "vq":
@@ -251,20 +250,21 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
             z_quantized = rearrange(z_quantized, 'b h w c -> b c h w').contiguous()
         elif self.quantize_mode == "vae":
             z_quantized = tokens
-        decoded = self.decode(z_quantized)
-        return decoded
+        decoded,cls_reconsturcted = self.decode(z_quantized)
+        return decoded,cls_reconsturcted
     
-    def forward(self, x, **kwargs):
+    def forward(self, x, semantic_token_dict = None, **kwargs):
         '''
         encode-quantize-decode & calculate prior loss
-        pass the following during training:
+        pass the following during training if using prior loss:
             global_step
             max_steps
         '''
         # encoding
-        z_quantized, result_dict = self.encode(x) # z_quantized : [B,D,1,N]
+        z_quantized, result_dict = self.encode(x,semantic_token_dict) # z_quantized : [B,D,1,N]
         # decoding
-        decoded = self.decode(z_quantized)
+        decoded,cls_reconsturcted = self.decode(z_quantized)
+        result_dict["cls_recon"] = cls_reconsturcted
         # prepare for prior loss
         if self.training and self.quantize_mode == 'vq' and self.use_prior_model:
             min_encoding_indices = result_dict["min_encoding_indices"] # [B,1,N] # assert VQ

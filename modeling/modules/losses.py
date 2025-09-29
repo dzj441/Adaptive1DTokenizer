@@ -117,6 +117,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             config: A dictionary, the configuration for the model and everything else.
         """
         super().__init__()
+        self.use_semantic_guidance = config.model.vq_model.get("use_semantic_guidance",False)
         loss_config = config.losses
         self.discriminator = NLayerDiscriminator()
 
@@ -133,6 +134,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
         self.lecam_regularization_weight = loss_config.lecam_regularization_weight
         self.lecam_ema_decay = loss_config.get("lecam_ema_decay", 0.999)
         self.loss_latent_ce_weight = loss_config.get("loss_latent_ce_weight",0.06)
+        self.semantic_cls_weight = loss_config.get("semantic_cls_weight", 0.1)
 
         self.disc_input_shift = loss_config.get("disc_input_shift", False)
 
@@ -188,7 +190,18 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
 
         # Compute perceptual loss.
         perceptual_loss = self.perceptual_loss(inputs, reconstructions).mean()
+        # Compute semantic cls loss.
+        semantic_cls_loss = torch.zeros((), device=inputs.device)
+        cls_recon = extra_result_dict.get("cls_recon", None)
+        target_cls = extra_result_dict.get("x_norm_clstoken", None)
 
+        if (cls_recon is not None) and (target_cls is not None):
+            if cls_recon.dim() > 2:
+                cls_recon = cls_recon.view(cls_recon.size(0), -1)
+            if target_cls.dim() > 2:
+                target_cls = target_cls.view(target_cls.size(0), -1) # [B,D]
+            semantic_cls_loss = F.mse_loss(cls_recon.float(),target_cls.float().detach(),reduction="mean")
+        
         # Compute discriminator loss.
         generator_loss = torch.zeros((), device=inputs.device)
         discriminator_factor = self.discriminator_factor if self.should_discriminator_be_trained(global_step) else 0
@@ -219,6 +232,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             + self.quantizer_weight * quantizer_loss
             + d_weight * discriminator_factor * generator_loss
             + self.loss_latent_ce_weight * latent_ce_loss
+            + self.semantic_cls_weight * semantic_cls_loss
         )
         loss_dict = dict(
             total_loss=total_loss.clone().detach(),
@@ -232,6 +246,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             d_weight=d_weight,
             gan_loss=generator_loss.detach(),
             latent_ce_loss=(self.loss_latent_ce_weight * latent_ce_loss).detach(),
+            semantic_cls_loss=(self.semantic_cls_weight * semantic_cls_loss).detach(),
         )
 
         return total_loss, loss_dict
