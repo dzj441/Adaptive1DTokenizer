@@ -89,11 +89,8 @@ class LPIPS(nn.Module):
         VGG_PATH = ckpt_path
 
         if not os.path.exists(VGG_PATH): # download
-            print(f"{VGG_PATH} not found, downloading from {URL_MAP['vgg_lpips']} ...")
-            os.makedirs(os.path.dirname(VGG_PATH), exist_ok=True)
-            download(URL_MAP["vgg_lpips"], VGG_PATH)
-            md5 = md5_hash(VGG_PATH)
-            assert md5 == MD5_MAP["vgg_lpips"], f"MD5 mismatch: expected {MD5_MAP['vgg_lpips']}, got {md5}"
+            workspace = os.environ.get('WORKSPACE', '')
+            VGG_PATH = get_ckpt_path("vgg_lpips", os.path.join(workspace, "models/vgg_lpips.pth"), check=True)
 
         print(f"Loading LPIPS weights from {VGG_PATH}")
         self.load_state_dict(torch.load(VGG_PATH, map_location=torch.device("cpu")), strict=False)
@@ -149,20 +146,15 @@ class NetLinLayer(nn.Module):
 class vgg16(torch.nn.Module):
     def __init__(self, requires_grad=False, pretrained=True, imagenet_vgg16_path: str = "./weights/vgg16-397923af.pth"):
         super(vgg16, self).__init__()
-        
-        # Build VGG16 architecture without loading online weights
-        base_vgg = models.vgg16(weights=None)
 
         if pretrained:
-            if not os.path.exists(imagenet_vgg16_path):
-                raise FileNotFoundError(
-                    f"ImageNet VGG16 weights not found at {imagenet_vgg16_path}. "
-                    f"Please download 'vgg16-397923af.pth' to this location."
-                )
-            # Load local ImageNet VGG16 weights
-            state_dict = torch.load(imagenet_vgg16_path, map_location="cpu")
-            base_vgg.load_state_dict(state_dict)
-            
+            if os.path.exists(imagenet_vgg16_path):
+                # Load local ImageNet VGG16 weights
+                base_vgg = models.vgg16(weights=None)
+                state_dict = torch.load(imagenet_vgg16_path, map_location="cpu")
+                base_vgg.load_state_dict(state_dict)
+            else:
+                base_vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
         vgg_pretrained_features = base_vgg.features
 
         self.slice1 = torch.nn.Sequential()

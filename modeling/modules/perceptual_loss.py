@@ -57,14 +57,12 @@ class PerceptualLoss(torch.nn.Module):
             self.lpips = LPIPS().eval()
 
         if "convnext_s" in model_name:
-            base_convnext = models.convnext_small(weights=None)
-            if not os.path.exists(convnext_small_path):
-                raise FileNotFoundError(
-                    f"ConvNeXt-Small weights not found at {convnext_small_path}. "
-                    f"Please download 'convnext_small-0c510722.pth' to this location."
-                )
-            state_dict = torch.load(convnext_small_path, map_location="cpu")
-            base_convnext.load_state_dict(state_dict)
+            if os.path.exists(convnext_small_path):
+                base_convnext = models.convnext_small(weights=None)
+                state_dict = torch.load(convnext_small_path, map_location="cpu")
+                base_convnext.load_state_dict(state_dict)
+            else:
+                base_convnext = models.convnext_small(weights=models.ConvNeXt_Small_Weights.IMAGENET1K_V1)
             self.convnext = base_convnext.eval()
 
         if "lpips" in model_name and "convnext_s" in model_name:
