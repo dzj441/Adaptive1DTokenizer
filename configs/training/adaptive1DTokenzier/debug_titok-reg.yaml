@@ -1,0 +1,101 @@
+experiment:
+    project: "titok_bl128_vq_reg"
+    name: "titok_bl128_vq_reg"
+    output_dir: "titok_bl128_vq_reg_run1"
+    max_train_examples: 1_281_167
+    save_every: 100
+    eval_every: 100
+    generate_every: 50
+    log_every: 10
+    log_grad_norm_every: 100
+    resume: True
+
+model:
+    vq_model:
+        use_prior_model: False
+        use_semantic_guidance: True
+        quantize_mode: vq
+        codebook_size: 8192
+        token_size: 64
+        use_l2_norm: False
+        commitment_cost: 0.25
+        clustering_vq: True
+        # vit arch
+        vit_enc_model_size: "base"
+        vit_dec_model_size: "large"
+        vit_enc_patch_size: 16
+        vit_dec_patch_size: 16
+        num_latent_tokens: 32
+        finetune_decoder: False
+        is_legacy: False
+    prior_model:
+        prior_model_type: gptc-S
+        use_mix_ss: true
+        mix_ss_max_ratio: 0.5
+        mix_ss_peak_steps_ratio: 0.3
+        n_rounds: 2
+        avg_loss_over_rounds: true
+        no_grad_before_last_round: false
+        no_dropout: false
+        latent_ce_temperature: 1.0
+        l2_normalized: true    
+        prior_token_sampling_policy: "greedy"
+    semantic_encoder:
+        enc_type: "dinov2-vit-b"
+        token_dim: 768 # 768 for b 1024 for l
+        
+        
+
+losses:
+    discriminator_start: 50
+    quantizer_weight: 1.0
+    discriminator_factor: 1.0
+    discriminator_weight: 0.1
+    perceptual_loss: "lpips-convnext_s-1.0-0.1"
+    perceptual_weight: 1.1
+    reconstruction_loss: "l2"
+    reconstruction_weight: 1.0
+    lecam_regularization_weight: 0.001
+    loss_latent_ce_weight: 0.06
+    semantic_cls_weight: 1.0    
+dataset:
+    format: "local"
+    params:
+        train_dir: "ImageNet/train"
+        eval_dir: "ImageNet/fake_val"
+        # train_shards_path_or_url: "ImageNet_wds/val/imagenet-val-{0000..0009}.tar"
+        # eval_shards_path_or_url: "ImageNet_wds/val/imagenet-val-0010.tar"
+        num_workers_per_gpu: 12
+    preprocessing:
+        resize_shorter_edge: 256
+        crop_size: 256
+        random_crop: True
+        random_flip: True
+optimizer:
+    name: adamw 
+    params:
+        learning_rate: 1e-4
+        discriminator_learning_rate: 1e-4
+        beta1: 0.9
+        beta2: 0.999
+        weight_decay: 1e-4
+        prior_lr_mult: 50.0 # prior ar model's lr multiplier
+
+lr_scheduler:
+    scheduler: "cosine"
+    params:
+        learning_rate: ${optimizer.params.learning_rate}
+        warmup_steps: 10
+        end_lr: 1e-5
+
+training:
+    gradient_accumulation_steps: 1
+    per_gpu_batch_size: 2
+    mixed_precision: "fp16"
+    enable_tf32: True
+    enable_wandb: False
+    use_ema: True
+    seed: 42
+    max_train_steps: 200
+    num_generated_images: 2
+    max_grad_norm: 1.0

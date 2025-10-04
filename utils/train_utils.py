@@ -621,7 +621,7 @@ def train_one_epoch(config, logger, accelerator,
                 else:
                     autoencoder_logs["train/" + k] = accelerator.gather(v).mean().item()
 
-            for m in ("prior_top1_acc", "prior_top5_acc"):
+            for m in ("prior_top1_acc", "prior_top5_acc","entropy_loss","n_reactivate","threshold_count"):
                 # prior related
                 v = extra_results_dict.get(m, None)
                 if v is None:
@@ -717,6 +717,9 @@ def train_one_epoch(config, logger, accelerator,
                     f"cls L2 Loss: {autoencoder_logs['train/semantic_cls_loss']:0.4f} "
                     f"d_weight: {autoencoder_logs['train/d_weight']:0.4f} "
                     f"D_factor: {autoencoder_logs['train/discriminator_factor']:0.4f} "
+                    f"entropy_loss: {autoencoder_logs['train/entropy_loss']:0.4f} "
+                    f"n_reactivate: {autoencoder_logs['train/n_reactivate']:0.4f} "
+                    f"threshold_count: {autoencoder_logs['train/threshold_count']:0.4f} "           
                 )
                 logs = {
                     "lr": lr,
@@ -1195,6 +1198,7 @@ def eval_reconstruction(
 
         original_images = torch.clone(images)
         if model_type == "titok":
+            semantic_feats = None
             if semantic_encoder is not None:
                 semantic_feats = semantic_encoder.forward_features(images)
             reconstructed_images, model_dict = local_model(images,semantic_feats)
@@ -1234,6 +1238,7 @@ def reconstruct_images(model, original_images, fnames, accelerator,
         dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         dtype = torch.bfloat16
+    semantic_feats = None
     if semantic_encoder is not None:
         semantic_feats = semantic_encoder.forward_features(original_images)    
     with torch.autocast("cuda", dtype=dtype, enabled=accelerator.mixed_precision != "no"):

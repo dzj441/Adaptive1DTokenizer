@@ -87,7 +87,7 @@ def preprocess_raw_image(x: torch.Tensor, enc_type: str) -> torch.Tensor:
 
 
 @torch.no_grad() 
-def load_encoders(enc_type, resolution=256):
+def load_encoders(enc_type, resolution=256,local = False,model_path = './dinov2'):
     """
     Return:
         encoders: List[nn.Module], each moved to device and eval()'ed.
@@ -132,26 +132,44 @@ def load_encoders(enc_type, resolution=256):
 
 
         elif 'dinov2' in encoder_type:
-            if 'reg' in encoder_type:
-                try:
-                    encoder = torch.hub.load('~/.cache/torch/hub/facebookresearch_dinov2_main',
-                                             f'dinov2_vit{model_config}14_reg', source='local')
-                except Exception:
-                    encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14_reg')
-            else:
-                try:
-                    encoder = torch.hub.load('~/.cache/torch/hub/facebookresearch_dinov2_main',
-                                             f'dinov2_vit{model_config}14', source='local')
-                except Exception:
-                    encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14')
+            if local and os.path.exists(model_path):
+                from transformers import Dinov2Config,Dinov2Model
+                from safetensors.torch import load_file                
+                config = Dinov2Config.from_pretrained(model_path)
+                encoder = Dinov2Model(config)
+                weights_path_safetensors = os.path.join(model_path, "model.safetensors")
+                weights_path_bin = os.path.join(model_path, "pytorch_model.bin")
+                
+                if os.path.exists(weights_path_safetensors):
+                    state_dict = load_file(weights_path_safetensors, device="cpu")
+                elif os.path.exists(weights_path_bin):
+                    state_dict = torch.load(weights_path_bin, map_location="cpu")
+                else:
+                    raise FileNotFoundError(f"No model.safetensors or pytorch_model.bin found in {model_path}")
+                encoder.load_state_dict(state_dict, strict=False) 
+                print(f"[load_encoders] Successfully loaded DINOv2 from local Hugging Face directory: {model_path}")
+                
+            else: # remote
+                if 'reg' in encoder_type:
+                    try:
+                        encoder = torch.hub.load('~/.cache/torch/hub/facebookresearch_dinov2_main',
+                                                 f'dinov2_vit{model_config}14_reg', source='local')
+                    except Exception:
+                        encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14_reg')
+                else:
+                    try:
+                        encoder = torch.hub.load('~/.cache/torch/hub/facebookresearch_dinov2_main',
+                                                 f'dinov2_vit{model_config}14', source='local')
+                    except Exception:
+                        encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14')
 
+                del encoder.head
+                patch_resolution = 16 * (resolution // 256)  # 256->16, 512->32
+                encoder.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
+                    encoder.pos_embed.data, [patch_resolution, patch_resolution],
+                )
+                encoder.head = torch.nn.Identity()
             print(f"[load_encoders] Using {enc_name} as aligning model (DINOv2)")
-            del encoder.head
-            patch_resolution = 16 * (resolution // 256)  # 256->16, 512->32
-            encoder.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
-                encoder.pos_embed.data, [patch_resolution, patch_resolution],
-            )
-            encoder.head = torch.nn.Identity()
             encoder.eval()
 
         elif 'dinov3' in encoder_type:
@@ -245,13 +263,14 @@ class PretrainedSemanticEncoder(nn.Module):
             'x_norm_registertokens':[B, R, D] (only for DINOv3 if R>0)
       - Exposes .embed_dim for compatibility with your training code.
     """
-    def __init__(self, enc_type: str, resolution: int = 256):
+    def __init__(self, enc_type: str, resolution: int = 256, local: bool = True):
         super().__init__()
         self.enc_type_str = enc_type
         self.resolution = resolution
+        self.local = local
 
         # Reuse your loader; we expect exactly one encoder here.
-        encoders, encoder_types, architectures = load_encoders(enc_type, resolution)
+        encoders, encoder_types, architectures = load_encoders(enc_type, resolution, local = self.local)
         assert len(encoders) == 1, f"PretrainedSemanticEncoder expects a single enc_type; got {len(encoders)}"
 
         self.base = encoders[0]              # underlying nn.Module
@@ -259,7 +278,15 @@ class PretrainedSemanticEncoder(nn.Module):
         self.architecture = architectures[0] # usually 'vit'
 
         if 'dinov2' in self.encoder_type:
-            self.embed_dim = int(getattr(self.base, 'embed_dim'))
+            if hasattr(self.base, 'embed_dim'):
+                # torch.hub / timm 
+                self.embed_dim = int(self.base.embed_dim)
+            elif self.local:
+                # Hugging Face 
+                self.embed_dim = int(self.base.config.hidden_size)
+            else:
+                raise AttributeError(f"Cannot determine embed_dim for encoder type {self.encoder_type}")
+
         elif 'dinov3' in self.encoder_type:
             self.embed_dim = int(self.base.config.hidden_size)
             self.num_register = int(getattr(self.base.config, "num_register_tokens", 0))
@@ -288,8 +315,18 @@ class PretrainedSemanticEncoder(nn.Module):
         # 2) model-specific forwarding and unification of outputs
         if 'dinov2' in self.encoder_type:
             # torch.hub dinov2 supports .forward_features(), returns dict with the same keys
-            feats = self.base.forward_features(x)
-            assert 'x_norm_clstoken' in feats and 'x_norm_patchtokens' in feats
+            if self.local:
+                out = self.base(pixel_values=x)
+                h = out.last_hidden_state  # [B, 1(+R)+N, D]
+                cls = h[:, 0, :]
+                patches = h[:,1:,:]
+                return {
+                    'x_norm_clstoken': cls,
+                    'x_norm_patchtokens': patches,
+                }                
+            else:
+                feats = self.base.forward_features(x)
+                assert 'x_norm_clstoken' in feats and 'x_norm_patchtokens' in feats
             return feats
 
         elif 'dinov3' in self.encoder_type:

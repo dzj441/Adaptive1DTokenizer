@@ -30,12 +30,44 @@ from accelerate.utils.operations import gather
 from accelerate.state import AcceleratorState
 
 
-def _safe_gather(x):
-    state = AcceleratorState()
-    if state.num_processes == 1:
+
+def _safe_gather(x: torch.Tensor) -> torch.Tensor:
+    try:
+        state = AcceleratorState()
+        if state.num_processes == 1:
+            return x
+    except Exception:
         return x
+    return gather(x)
+
+def _l2norm(t: torch.Tensor) -> torch.Tensor:
+    return F.normalize(t, p=2, dim=-1)
+
+def _entropy_loss(affinity: torch.Tensor, temperature: float = 0.01, mode: str = "softmax"):
+    """
+    Compute E[H(p)] - H(E[p]).
+    - affinity: [..., K]
+    - temperature: p = softmax(affinity / T)
+    - mode: 'softmax' or 'argmax' (straight-through onehot)
+    """
+    flat = affinity.view(-1, affinity.shape[-1]) / temperature
+    probs = F.softmax(flat, dim=-1)
+    log_probs = F.log_softmax(flat, dim=-1)
+
+    if mode == "softmax":
+        target_probs = probs
+    elif mode == "argmax":
+        codes = torch.argmax(flat, dim=-1)
+        onehots = F.one_hot(codes, num_classes=flat.shape[-1]).to(probs.dtype)
+        target_probs = probs - (probs - onehots).detach()
     else:
-        return gather(x) 
+        raise ValueError(f"Unsupported mode={mode}")
+
+    avg_probs = target_probs.mean(dim=0)
+    avg_entropy = -(avg_probs * torch.log(avg_probs + 1e-5)).sum()
+    sample_entropy = -(target_probs * log_probs).sum(dim=-1).mean()
+    loss = sample_entropy - avg_entropy
+    return loss, sample_entropy, avg_entropy
 
 class VectorQuantizer(nn.Module):
     def __init__(
@@ -43,56 +75,79 @@ class VectorQuantizer(nn.Module):
         codebook_size: int = 1024,
         token_size: int = 256,
         commitment_cost: float = 0.25,
-        use_l2_norm: bool = False,
+        use_l2_norm: bool = True,
         clustering_vq: bool = False,
+
+        use_reinit: bool = True,
+        reinit_decay: float = 0.99,
+        reinit_threshold_base: float = 0.0125, 
+        reset_boost: float = 1.1,
+        reactivate_after: int = 10000,
+        reactivate_every: int = 1,
+
+        # Optional entropy loss (kept off by default)
+        use_entropy_loss: bool = False,
+        entropy_temperature: float = 0.01,
+        entropy_mode: str = "softmax",
+        entropy_weight: float = 0.0,
     ):
         super().__init__()
         self.codebook_size = codebook_size
         self.token_size = token_size
         self.commitment_cost = commitment_cost
-
-        self.embedding = torch.nn.Embedding(codebook_size, token_size)
-        self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
         self.use_l2_norm = use_l2_norm
+
+        self.embedding = nn.Embedding(codebook_size, token_size)
+        self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+
         self.clustering_vq = clustering_vq
         if clustering_vq:
             self.decay = 0.99
-            # buffer for usage probs
             self.register_buffer("embed_prob", torch.zeros(codebook_size))
-            # EMA embedding (not tracked by autograd)
             self.register_buffer("ema_embedding", self.embedding.weight.detach().clone())
+
+        self.use_reinit = use_reinit
+        self.reinit_decay = float(reinit_decay)
+        self.reinit_threshold_base = float(reinit_threshold_base)
+        self.reset_boost = float(reset_boost)
+        self.reactivate_after = int(reactivate_after)
+        self.reactivate_every = int(reactivate_every)
+
+        self.register_buffer("cluster_size", torch.zeros(codebook_size))
+        self.register_buffer("threshold_count", torch.tensor(0.0))
+        self._threshold_inited = False
+
+        self.register_buffer("steps", torch.zeros((), dtype=torch.long))
+
+        # entropy loss
+        self.use_entropy_loss = use_entropy_loss
+        self.entropy_temperature = float(entropy_temperature)
+        self.entropy_mode = entropy_mode
+        self.entropy_weight = float(entropy_weight)
 
     @torch.autocast(device_type="cuda", enabled=False)
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, Mapping[Text, torch.Tensor]]:
         z = z.float()
-        z = rearrange(z, 'b c h w -> b h w c').contiguous()
-        z_flattened = rearrange(z, 'b h w c -> (b h w) c')
-        unnormed_z_flattened = z_flattened
+        z_bhwc = rearrange(z, 'b c h w -> b h w c').contiguous()
+        z_flat = rearrange(z_bhwc, 'b h w c -> (b h w) c')
+        unnormed_z_flattened = z_flat
+        z_flat_for_dist = _l2norm(z_flat) if self.use_l2_norm else z_flat
 
-        # choose which embedding to use for quantization
-        if self.clustering_vq:
-            emb_source = self.ema_embedding
-        else:
-            emb_source = self.embedding.weight
+        emb_source = self.ema_embedding if self.clustering_vq else self.embedding.weight
+        emb_for_dist = _l2norm(emb_source) if self.use_l2_norm else emb_source
 
-        if self.use_l2_norm:
-            z_flattened = F.normalize(z_flattened, dim=-1)
-            embedding = F.normalize(emb_source, dim=-1)
-        else:
-            embedding = self.embedding.weight
-        d = torch.sum(z_flattened**2, dim=1, keepdim=True) + \
-            torch.sum(embedding**2, dim=1) - 2 * \
-            torch.einsum('bd,dn->bn', z_flattened, embedding.T)
+        d = (
+            torch.sum(z_flat_for_dist**2, dim=1, keepdim=True)
+            + torch.sum(emb_for_dist**2, dim=1)
+            - 2 * torch.einsum('nd,kd->nk', z_flat_for_dist, emb_for_dist)
+        )
 
-        min_encoding_indices = torch.argmin(d, dim=1) # num_ele
-        z_quantized = self.get_codebook_entry(min_encoding_indices).view(z.shape)
+        min_encoding_indices = torch.argmin(d, dim=1)  # [N]
+        z_q = self.get_codebook_entry(min_encoding_indices).view_as(z_bhwc)
 
-        if self.use_l2_norm:
-            z = F.normalize(z, dim=-1)
-
-        # compute loss for embedding
-        commitment_loss = self.commitment_cost * torch.mean((z_quantized.detach() - z) **2)
-        codebook_loss = torch.mean((z_quantized - z.detach()) **2)
+        z_for_commit = _l2norm(z_bhwc) if self.use_l2_norm else z_bhwc
+        commitment_loss = self.commitment_cost * torch.mean((z_q.detach() - z_for_commit) ** 2)
+        codebook_loss = torch.mean((z_q - z_for_commit.detach()) ** 2)
 
         if self.clustering_vq and self.training:
             with torch.no_grad():
@@ -123,42 +178,218 @@ class VectorQuantizer(nn.Module):
                 self.ema_embedding.copy_(
                     self.ema_embedding * (1 - decay) + random_feat * decay
                 )
-        loss = commitment_loss + codebook_loss
+        total_loss = commitment_loss + codebook_loss
 
-        # preserve gradients
-        z_quantized = z + (z_quantized - z).detach()
+        # Dead-code reactivation 
+        n_reactivate = 0
+        if self.training and self.use_reinit:
+            with torch.no_grad():
+                self.steps += 1
+                g_idx = _safe_gather(min_encoding_indices)          # [N_global]
+                g_feats = _safe_gather(z_flat)                       # [N_global, D] (raw pool)
 
-        # reshape back to match original input shape
-        z_quantized = rearrange(z_quantized, 'b h w c -> b c h w').contiguous() # B,D,1,N
+                # init threshold in count-space on first fwd
+                if not self._threshold_inited:
+                    N_global = g_idx.shape[0]
+                    ratio = N_global / float(self.codebook_size)     # expected hits per code per step
+                    thr = self.reinit_threshold_base * ratio         # 2.0 * (N/K)
+                    self.threshold_count.data.copy_(torch.tensor(thr, device=self.threshold_count.device))
+                    self._threshold_inited = True
 
-        result_dict = dict(
-            quantizer_loss=loss,
+                # EMA update on cluster_size
+                bins = torch.bincount(g_idx, minlength=self.codebook_size).to(self.cluster_size.dtype)
+                self.cluster_size.mul_(self.reinit_decay).add_(bins, alpha=1 - self.reinit_decay)
+
+                # gated by warmup and frequency
+                do_react = (self.steps.item() >= self.reactivate_after) and \
+                           ((self.steps.item() - self.reactivate_after) % max(1, self.reactivate_every) == 0)
+
+                if do_react:
+                    dead_mask = self.cluster_size < self.threshold_count
+                    if dead_mask.any() and g_feats.numel() > 0:
+                        dead_idx = torch.nonzero(dead_mask, as_tuple=False).squeeze(1)
+                        num_dead = int(dead_idx.numel())
+
+                        M = g_feats.shape[0]
+                        if M >= num_dead:
+                            sel = torch.randperm(M, device=g_feats.device)[:num_dead]
+                        else:
+                            sel = torch.randint(0, M, (num_dead,), device=g_feats.device)
+                        new_codes = g_feats[sel]
+                        if self.use_l2_norm:
+                            new_codes = _l2norm(new_codes)
+
+                        # write into embedding used by quantization
+                        if self.clustering_vq:
+                            self.ema_embedding.data[dead_idx] = new_codes
+                            self.embedding.weight.data[dead_idx] = new_codes
+                        else:
+                            self.embedding.weight.data[dead_idx] = new_codes
+
+                        # lift counts so they don't immediately die again
+                        safe_val = float(self.reset_boost) * float(self.threshold_count.item())
+                        self.cluster_size.data[dead_idx] = safe_val
+                        n_reactivate = num_dead
+
+        # straight-through
+        z_out = z_for_commit + (z_q - z_for_commit).detach()
+        z_out = rearrange(z_out, 'b h w c -> b c h w').contiguous()
+
+        # optional entropy loss
+        ent_loss = sample_entropy = avg_entropy = 0.0
+        if self.use_entropy_loss:
+            ent_loss, sample_entropy, avg_entropy = _entropy_loss(-d, temperature=self.entropy_temperature,
+                                                                  mode=self.entropy_mode)
+            if self.entropy_weight != 0.0:
+                total_loss = total_loss + self.entropy_weight * ent_loss
+
+        result = dict(
+            quantizer_loss=total_loss,
             commitment_loss=commitment_loss,
             codebook_loss=codebook_loss,
-            min_encoding_indices=min_encoding_indices.view(z_quantized.shape[0], z_quantized.shape[2], z_quantized.shape[3]) # B,1,N
+            min_encoding_indices=min_encoding_indices.view(z_out.shape[0], z_out.shape[2], z_out.shape[3]),
+            entropy_loss=ent_loss,
+            n_reactivate=n_reactivate,
+            threshold_count=float(self.threshold_count.item()),
         )
+        return z_out, result
 
-        return z_quantized, result_dict
-
-    def get_codebook_entry(self, indices):
-        if len(indices.shape) == 1:
-            z_quantized = self.embedding(indices)
-        elif len(indices.shape) == 2:
-            z_quantized = torch.einsum('bd,dn->bn', indices, self.embedding.weight)
+    def get_codebook_entry(self, indices: torch.Tensor) -> torch.Tensor:
+        if indices.ndim == 1:
+            zq = self.embedding(indices)
+        elif indices.ndim == 2:
+            zq = torch.einsum('nk,kd->nd', indices, self.embedding.weight)
         else:
             raise NotImplementedError
-        if self.use_l2_norm:
-            z_quantized = torch.nn.functional.normalize(z_quantized, dim=-1)
-        return z_quantized
+        return _l2norm(zq) if self.use_l2_norm else zq
 
     @torch.autocast(device_type='cuda', enabled=False)
     def get_emb(self):
-        if self.use_l2_norm:
-            emb = torch.nn.functional.normalize(self.embedding.weight, dim=-1)
-        else:
-            emb = self.embedding.weight
-        assert emb.dtype == torch.float32, f"Embedding weight dtype is {emb.dtype}, expected float32"
-        return emb
+        emb = self.embedding.weight
+        return _l2norm(emb) if self.use_l2_norm else emb
+
+# class VectorQuantizer(nn.Module):
+#     def __init__(
+#         self,
+#         codebook_size: int = 1024,
+#         token_size: int = 256,
+#         commitment_cost: float = 0.25,
+#         use_l2_norm: bool = False,
+#         clustering_vq: bool = False,
+#     ):
+#         super().__init__()
+#         self.codebook_size = codebook_size
+#         self.token_size = token_size
+#         self.commitment_cost = commitment_cost
+
+#         self.embedding = torch.nn.Embedding(codebook_size, token_size)
+#         self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+#         self.use_l2_norm = use_l2_norm
+#         self.clustering_vq = clustering_vq
+#         if clustering_vq:
+#             self.decay = 0.99
+#             # buffer for usage probs
+#             self.register_buffer("embed_prob", torch.zeros(codebook_size))
+#             # EMA embedding (not tracked by autograd)
+#             self.register_buffer("ema_embedding", self.embedding.weight.detach().clone())
+
+#     @torch.autocast(device_type="cuda", enabled=False)
+#     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, Mapping[Text, torch.Tensor]]:
+#         z = z.float()
+#         z = rearrange(z, 'b c h w -> b h w c').contiguous()
+#         z_flattened = rearrange(z, 'b h w c -> (b h w) c')
+#         unnormed_z_flattened = z_flattened
+
+#         # choose which embedding to use for quantization
+#         if self.clustering_vq:
+#             emb_source = self.ema_embedding
+#         else:
+#             emb_source = self.embedding.weight
+
+#         if self.use_l2_norm:
+#             z_flattened = F.normalize(z_flattened, dim=-1)
+#             embedding = F.normalize(emb_source, dim=-1)
+#         else:
+#             embedding = self.embedding.weight
+#         d = torch.sum(z_flattened**2, dim=1, keepdim=True) + \
+#             torch.sum(embedding**2, dim=1) - 2 * \
+#             torch.einsum('bd,dn->bn', z_flattened, embedding.T)
+
+#         min_encoding_indices = torch.argmin(d, dim=1) # num_ele
+#         z_quantized = self.get_codebook_entry(min_encoding_indices).view(z.shape)
+
+#         if self.use_l2_norm:
+#             z = F.normalize(z, dim=-1)
+
+#         # compute loss for embedding
+#         commitment_loss = self.commitment_cost * torch.mean((z_quantized.detach() - z) **2)
+#         codebook_loss = torch.mean((z_quantized - z.detach()) **2)
+
+#         if self.clustering_vq and self.training:
+#             with torch.no_grad():
+#                 # usage update
+#                 encoding_indices = _safe_gather(min_encoding_indices)
+#                 if len(min_encoding_indices.shape) != 1:
+#                     raise ValueError(f"min_encoding_indices in a wrong shape, {min_encoding_indices.shape}")
+#                 # Compute and update the usage of each entry in the codebook.
+#                 encodings = torch.zeros(encoding_indices.shape[0], self.codebook_size, device=z.device)
+#                 encodings.scatter_(1, encoding_indices.unsqueeze(1), 1)
+#                 avg_probs = torch.mean(encodings, dim=0)
+#                 self.embed_prob.mul_(self.decay).add_(avg_probs, alpha=1-self.decay)
+#                 # codebook update
+#                 all_d = _safe_gather(d)
+#                 all_unnormed_z_flattened = _safe_gather(unnormed_z_flattened).detach()
+#                 if all_d.shape[0] != all_unnormed_z_flattened.shape[0]:
+#                     raise ValueError(
+#                         "all_d and all_unnormed_z_flattened have different length" + 
+#                         f"{all_d.shape}, {all_unnormed_z_flattened.shape}")
+#                 indices = torch.argmin(all_d, dim=0)
+#                 random_feat = all_unnormed_z_flattened[indices]
+
+#                 decay = torch.exp(
+#                     -(self.embed_prob * self.codebook_size * 10)
+#                     / (1 - self.decay) - 1e-3).view(-1, 1).expand(-1, self.token_size)
+
+#                 # update EMA embedding safely
+#                 self.ema_embedding.copy_(
+#                     self.ema_embedding * (1 - decay) + random_feat * decay
+#                 )
+#         loss = commitment_loss + codebook_loss
+
+#         # preserve gradients
+#         z_quantized = z + (z_quantized - z).detach()
+
+#         # reshape back to match original input shape
+#         z_quantized = rearrange(z_quantized, 'b h w c -> b c h w').contiguous() # B,D,1,N
+
+#         result_dict = dict(
+#             quantizer_loss=loss,
+#             commitment_loss=commitment_loss,
+#             codebook_loss=codebook_loss,
+#             min_encoding_indices=min_encoding_indices.view(z_quantized.shape[0], z_quantized.shape[2], z_quantized.shape[3]) # B,1,N
+#         )
+
+#         return z_quantized, result_dict
+
+#     def get_codebook_entry(self, indices):
+#         if len(indices.shape) == 1:
+#             z_quantized = self.embedding(indices)
+#         elif len(indices.shape) == 2:
+#             z_quantized = torch.einsum('bd,dn->bn', indices, self.embedding.weight)
+#         else:
+#             raise NotImplementedError
+#         if self.use_l2_norm:
+#             z_quantized = torch.nn.functional.normalize(z_quantized, dim=-1)
+#         return z_quantized
+
+#     @torch.autocast(device_type='cuda', enabled=False)
+#     def get_emb(self):
+#         if self.use_l2_norm:
+#             emb = torch.nn.functional.normalize(self.embedding.weight, dim=-1)
+#         else:
+#             emb = self.embedding.weight
+#         assert emb.dtype == torch.float32, f"Embedding weight dtype is {emb.dtype}, expected float32"
+#         return emb
 
 class DiagonalGaussianDistribution(object):
     @torch.autocast(device_type="cuda",enabled=False)
