@@ -267,42 +267,18 @@ def create_optimizer(config, logger, model, loss_module,
         optimizer_cls = AdamW
     else:
         raise ValueError(f"Optimizer {optimizer_type} not supported")
-    
-    if config.model.vq_model.use_prior_model:
-        prior_lr_mult = optimizer_config.get("prior_lr_mult") # prior model lr mult
-    
     # Exclude terms we may not want to apply weight decay.
     exclude = (lambda n, p: p.ndim < 2 or "ln" in n or "bias" in n or 'latent_tokens' in n 
                or 'mask_token' in n or 'embedding' in n or 'norm' in n or 'gamma' in n or 'embed' in n)
     include = lambda n, p: not exclude(n, p)
-    
     named_parameters = list(model.named_parameters())
-    nonprior_gain_or_bias_params, nonprior_rest_params = [], []
-    prior_gain_or_bias_params, prior_rest_params = [], []
-
-    for n, p in named_parameters:
-        if not p.requires_grad:
-            continue
-        is_prior = n.startswith("prior_model.")
-        if exclude(n, p):
-            (prior_gain_or_bias_params if is_prior else nonprior_gain_or_bias_params).append(p)
-        else:
-            (prior_rest_params if is_prior else nonprior_rest_params).append(p)
-
-    param_groups = []
-    # non prior（lr = base）
-    if nonprior_gain_or_bias_params:
-        param_groups.append({"params": nonprior_gain_or_bias_params, "weight_decay": 0., "lr": learning_rate})
-    if nonprior_rest_params:
-        param_groups.append({"params": nonprior_rest_params, "weight_decay": optimizer_config.weight_decay, "lr": learning_rate})
-    # prior（lr = base * mult）
-    if prior_gain_or_bias_params:
-        param_groups.append({"params": prior_gain_or_bias_params, "weight_decay": 0., "lr": learning_rate * prior_lr_mult})
-    if prior_rest_params:
-        param_groups.append({"params": prior_rest_params, "weight_decay": optimizer_config.weight_decay, "lr": learning_rate * prior_lr_mult})
-
+    gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
+    rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
     optimizer = optimizer_cls(
-        param_groups,
+        [
+            {"params": gain_or_bias_params, "weight_decay": 0.},
+            {"params": rest_params, "weight_decay": optimizer_config.weight_decay},
+        ],
         lr=learning_rate,
         betas=(optimizer_config.beta1, optimizer_config.beta2)
     )

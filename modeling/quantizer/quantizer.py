@@ -78,7 +78,7 @@ class simVQ(nn.Module):
         commitment_cost: float = 0.25,
         use_l2_norm: bool = False,
         clustering_vq: bool = False,
-        simvq: bool = True,  # 新增：SimVQ 默认开启
+        simvq: bool = True,
     ):
         super().__init__()
         self.codebook_size = codebook_size
@@ -88,7 +88,6 @@ class simVQ(nn.Module):
         self.embedding = torch.nn.Embedding(codebook_size, token_size)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=self.token_size ** -0.5)
 
-        # 保留原参数以兼容，但在 simvq=True 时不使用
         self.use_l2_norm = use_l2_norm
         self.clustering_vq = clustering_vq
 
@@ -115,28 +114,15 @@ class simVQ(nn.Module):
     @torch.autocast(device_type="cuda", enabled=False)
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, Mapping[Text, torch.Tensor]]:
         """
-        输入 z: 形状 [B, C, H, W]（也兼容 H=1, W=L 的一维场景）
-        返回:
           z_quantized: [B, C, H, W]
           result_dict: dict(quantizer_loss, commitment_loss, codebook_loss, min_encoding_indices[B,H,W])
         """
         z = z.float()
-        # 重排到 [B, H, W, C] 再展平
         z_hw_c = rearrange(z, 'b c h w -> b h w c').contiguous()
         z_flattened = rearrange(z_hw_c, 'b h w c -> (b h w) c')  # [N, D]
 
-        # 选择量化码本的基底
         if self.simvq:
-            # SimVQ: 使用投影后的码本 C @ W
             codebook_projected = self.embedding_proj(self.embedding.weight)  # [K, D]
-        else:
-            # 非 SimVQ 路径（保留兼容）
-            emb_source = self.ema_embedding if self.clustering_vq else self.embedding.weight
-            if self.use_l2_norm:
-                z_flattened = F.normalize(z_flattened, dim=-1)
-                emb_source = F.normalize(emb_source, dim=-1)
-            codebook_projected = emb_source  # [K, D]
-
 
         if self.use_l2_norm:
             z_for_dist  = F.normalize(z_flattened,dim=-1,eps=1e-6)
@@ -145,32 +131,27 @@ class simVQ(nn.Module):
             z_for_dist  = z_flattened
             codebook_for_dist = codebook_projected
 
-        # 距离矩阵 d: [N, K]，使用 ||z||^2 + ||q||^2 - 2 z·q
         d = torch.sum(z_for_dist**2, dim=1, keepdim=True) + \
             torch.sum(codebook_for_dist**2, dim=1) - 2 * \
             torch.einsum('bd,dn->bn', z_for_dist, codebook_for_dist.T)
         
 
-        # 最近邻索引
+        # argmin
         min_encoding_indices = torch.argmin(d, dim=1)  # [N]
 
-        # 查表得到量化向量（使用与计算距离一致的码本）
         z_quantized_hw_c = self.get_codebook_entry(min_encoding_indices).view(z_hw_c.shape)
         if self.use_l2_norm:
             z_hw_c = torch.nn.functional.normalize(z_hw_c, dim=-1)
         
-        # 计算损失（保持你原公式与标量命名）
         commitment_loss = self.commitment_cost * torch.mean((z_quantized_hw_c.detach() - z_hw_c) ** 2)
         codebook_loss = torch.mean((z_quantized_hw_c - z_hw_c.detach()) ** 2)
         loss = commitment_loss + codebook_loss
 
-        # 直通估计（STE）：前向替换为量化值，反向对编码器等价恒等
+        # （STE）
         z_quantized_hw_c = z_hw_c + (z_quantized_hw_c - z_hw_c).detach()
 
-        # 还原到 [B, C, H, W]
         z_quantized = rearrange(z_quantized_hw_c, 'b h w c -> b c h w').contiguous()
 
-        # 索引形状回到 [B, H, W]
         B, C, H, W = z.shape
         min_encoding_indices = min_encoding_indices.view(B, H, W)
 
@@ -192,7 +173,6 @@ class simVQ(nn.Module):
            weight = F.normalize(weight, dim=-1, eps=1e-6)
         
         if len(indices.shape) == 1:
-            # 离散索引查表
             z_quantized = F.embedding(indices, weight)
         elif len(indices.shape) == 2:
             # soft one-hot * codebook
@@ -210,6 +190,7 @@ class simVQ(nn.Module):
         if self.use_l2_norm:
             weight = F.normalize(weight, dim=-1, eps=1e-6)
         return weight
+
 class VectorQuantizer(nn.Module):
     def __init__(
         self,
