@@ -22,7 +22,7 @@ from einops import rearrange
 
 from modeling.modules.base_model import BaseModel
 from modeling.modules.blocks import TiTokEncoder, TiTokDecoder
-from modeling.quantizer.quantizer import VectorQuantizer, DiagonalGaussianDistribution
+from modeling.quantizer.quantizer import VectorQuantizer, DiagonalGaussianDistribution,simVQ
 from modeling.modules.maskgit_vqgan import Encoder as Pixel_Eecoder
 from modeling.modules.maskgit_vqgan import Decoder as Pixel_Decoder
 from modeling.modules.maskgit_vqgan import VectorQuantizer as Pixel_Quantizer
@@ -102,6 +102,12 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
         self.latent_tokens = nn.Parameter(
             scale * torch.randn(self.num_latent_tokens, self.encoder.width))
         
+        self.num_semantic_latent_tokens = config.model.vq_model.get("num_semantic_latent_tokens", 0)
+        if self.num_semantic_latent_tokens > 0:
+            self.semantic_latent = nn.Parameter(
+                scale * torch.randn(self.num_semantic_latent_tokens, self.encoder.width))
+        else:
+            self.semantic_latent = None
 
         if self.use_prior_model:
             self.prior_model_type = config.model.prior_model.get("prior_model_type", "gptc-S")
@@ -147,7 +153,7 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
         self.apply(self._init_weights)
 
         if self.quantize_mode == "vq":
-            self.quantize = VectorQuantizer(
+            self.quantize = simVQ(
                 codebook_size=config.model.vq_model.codebook_size,
                 token_size=config.model.vq_model.token_size,
                 commitment_cost=config.model.vq_model.commitment_cost,
@@ -223,7 +229,7 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
                 result_dict["commitment_loss"] *= 0
                 result_dict["codebook_loss"] *= 0
         else:
-            z = self.encoder(pixel_values=x, latent_tokens=self.latent_tokens,semantic_token_dict = semantic_token_dict)
+            z = self.encoder(pixel_values=x, latent_tokens=self.latent_tokens , semantic_latent = self.semantic_latent, semantic_token_dict = semantic_token_dict)
             if self.quantize_mode == "vq":
                 z_quantized, result_dict = self.quantize(z)
             elif self.quantize_mode == "vae":

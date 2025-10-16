@@ -26,7 +26,7 @@ from torch.utils.checkpoint import checkpoint
 from collections import OrderedDict
 import einops
 from einops.layers.torch import Rearrange
-
+from typing import Optional
 
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
@@ -58,15 +58,17 @@ class ResidualAttentionBlock(nn.Module):
 
     def attention(
             self,
-            x: torch.Tensor
+            x: torch.Tensor,
+            attn_mask: Optional[torch.Tensor] = None
     ):
-        return self.attn(x, x, x, need_weights=False)[0]
+        return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
 
     def forward(
             self,
             x: torch.Tensor,
+            attn_mask: Optional[torch.Tensor] = None,
     ):
-        attn_output = self.attention(x=self.ln_1(x))
+        attn_output = self.attention(x=self.ln_1(x), attn_mask=attn_mask)
         x = x + attn_output
         if self.mlp_ratio > 0:
             x = x + self.mlp(self.ln_2(x))
@@ -207,6 +209,30 @@ class UViTBlock(nn.Module):
 def _expand_token(token, batch_size: int):
     return token.unsqueeze(0).expand(batch_size, -1, -1)
 
+def _build_attn_mask(x, grid_size, num_latent_tokens, num_semantic_latent_tokens, latent_sem_first, mask_type):
+    if mask_type == "full" or num_semantic_latent_tokens == 0:
+        return None
+    B, T, D = x.shape
+    G = grid_size ** 2
+    S = num_semantic_latent_tokens
+    L = num_latent_tokens
+    assert T == 1 + G + S + L
+    c0, c1 = 0, 1
+    m0, m1 = 1, 1 + G
+    if latent_sem_first:
+        s0, s1 = m1, m1 + S
+        l0, l1 = s1, s1 + L
+    else:
+        l0, l1 = m1, m1 + L
+        s0, s1 = l1, l1 + S
+    neginf = float("-inf")
+    attn_mask = x.new_zeros((T, T))
+    attn_mask[c0:c1, :] = neginf
+    attn_mask[c0:c1, c0:c1] = 0
+    attn_mask[c0:c1, s0:s1] = 0
+    attn_mask[m0:m1, c0:c1] = neginf
+    attn_mask[l0:l1, c0:c1] = neginf
+    return attn_mask
 
 class TiTokEncoder(nn.Module):
     def __init__(self, config):
@@ -256,6 +282,18 @@ class TiTokEncoder(nn.Module):
                 scale * torch.randn(self.grid_size ** 2 + 1, self.width))
         self.latent_token_positional_embedding = nn.Parameter(
             scale * torch.randn(self.num_latent_tokens, self.width))
+        self.num_semantic_tokens = config.model.vq_model.get("num_semantic_latent_tokens", 0)
+        self.num_total_latent_tokens = self.num_latent_tokens + self.num_semantic_tokens
+        self.latent_sem_first = config.model.vq_model.get("latent_sem_first", False)
+        if self.num_semantic_tokens > 0:
+            self.semantic_token_positional_embedding = nn.Parameter(
+                scale * torch.randn(self.num_semantic_tokens, self.width))
+            self.type_embed_img = nn.Parameter(scale * torch.randn(1, 1, self.width))
+            self.type_embed_sem = nn.Parameter(scale * torch.randn(1, 1, self.width))
+        else:
+            self.semantic_token_positional_embedding = None
+            self.type_embed_img = None
+            self.type_embed_sem = None
         self.ln_pre = nn.LayerNorm(self.width)
         self.transformer = nn.ModuleList()
         for i in range(self.num_layers):
@@ -265,7 +303,7 @@ class TiTokEncoder(nn.Module):
         self.ln_post = nn.LayerNorm(self.width)
         self.conv_out = nn.Conv2d(self.width, self.token_size, kernel_size=1, bias=True)
 
-    def forward(self, pixel_values, latent_tokens, semantic_token_dict):
+    def forward(self, pixel_values, latent_tokens, semantic_latent ,semantic_token_dict):
         batch_size = pixel_values.shape[0]
         x = pixel_values
         x = self.patch_embed(x)
@@ -280,10 +318,19 @@ class TiTokEncoder(nn.Module):
         x = torch.cat([cls_token, x], dim=1)
         x = x + self.positional_embedding.to(x.dtype) # shape = [*, grid ** 2 + 1, width]
         
-
         latent_tokens = _expand_token(latent_tokens, x.shape[0]).to(x.dtype)
         latent_tokens = latent_tokens + self.latent_token_positional_embedding.to(x.dtype)
-        x = torch.cat([x, latent_tokens], dim=1)
+        if self.num_semantic_tokens > 0:
+            latent_tokens = latent_tokens + self.type_embed_img.to(x.dtype)
+            semantic_latent = _expand_token(semantic_latent, x.shape[0]).to(x.dtype)
+            semantic_latent = semantic_latent + self.semantic_token_positional_embedding.to(x.dtype)
+            semantic_latent = semantic_latent + self.type_embed_sem.to(x.dtype)
+            if self.latent_sem_first:
+                x = torch.cat([x, semantic_latent, latent_tokens], dim=1) # cls img l_sem l_lat
+            else:
+                x = torch.cat([x, latent_tokens, semantic_latent], dim=1) # cls img l_lat l_sem
+        else:
+            x = torch.cat([x, latent_tokens], dim=1)
 
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # NLD -> LND
@@ -295,12 +342,12 @@ class TiTokEncoder(nn.Module):
         latent_tokens = self.ln_post(latent_tokens)
         # fake 2D shape
         if self.is_legacy:
-            latent_tokens = latent_tokens.reshape(batch_size, self.width, self.num_latent_tokens, 1)
+            latent_tokens = latent_tokens.reshape(batch_size, self.width, self.num_total_latent_tokens, 1)
         else:
             # Fix legacy problem.
-            latent_tokens = latent_tokens.reshape(batch_size, self.num_latent_tokens, self.width, 1).permute(0, 2, 1, 3)
+            latent_tokens = latent_tokens.reshape(batch_size, self.num_total_latent_tokens, self.width, 1).permute(0, 2, 1, 3)
         latent_tokens = self.conv_out(latent_tokens)
-        latent_tokens = latent_tokens.reshape(batch_size, self.token_size, 1, self.num_latent_tokens)
+        latent_tokens = latent_tokens.reshape(batch_size, self.token_size, 1, self.num_total_latent_tokens)
         return latent_tokens
     
 
@@ -313,6 +360,12 @@ class TiTokDecoder(nn.Module):
         self.grid_size = self.image_size // self.patch_size
         self.model_size = config.model.vq_model.vit_dec_model_size
         self.num_latent_tokens = config.model.vq_model.num_latent_tokens
+
+        self.num_semantic_latent_tokens = config.model.vq_model.get("num_semantic_latent_tokens", 0)
+        self.num_total_latent_tokens = self.num_latent_tokens + self.num_semantic_latent_tokens
+        self.latent_sem_first = config.model.vq_model.get("latent_sem_first", False)
+        self.dec_mask_type = config.model.vq_model.get("dec_mask_type", "full")
+
         self.token_size = config.model.vq_model.token_size
         self.is_legacy = config.model.vq_model.get("is_legacy", True)
         self.width = {
@@ -339,8 +392,19 @@ class TiTokDecoder(nn.Module):
                 scale * torch.randn(self.grid_size ** 2 + 1, self.width))
         # add mask token and query pos embed
         self.mask_token = nn.Parameter(scale * torch.randn(1, 1, self.width))
-        self.latent_token_positional_embedding = nn.Parameter(
+
+        self.latent_img_positional_embedding = nn.Parameter(
             scale * torch.randn(self.num_latent_tokens, self.width))
+        if self.num_semantic_latent_tokens > 0:
+            self.latent_sem_positional_embedding = nn.Parameter(
+                scale * torch.randn(self.num_semantic_latent_tokens, self.width))
+            self.type_embed_img_dec = nn.Parameter(scale * torch.randn(1, 1, self.width))
+            self.type_embed_sem_dec = nn.Parameter(scale * torch.randn(1, 1, self.width))
+        else:
+            self.latent_sem_positional_embedding = None
+            self.type_embed_img_dec = None
+            self.type_embed_sem_dec = None
+
         self.ln_pre = nn.LayerNorm(self.width)
         self.transformer = nn.ModuleList()
         for i in range(self.num_layers):
@@ -367,11 +431,11 @@ class TiTokDecoder(nn.Module):
         if self.use_semantic_guidance:
             self.semantic_guidance_dim = config.model.semantic_encoder.token_dim
             self.cls_out = nn.Linear(self.width, self.semantic_guidance_dim, bias=True)            
-    
+
     def forward(self, z_quantized):
         N, C, H, W = z_quantized.shape
-        assert H == 1 and W == self.num_latent_tokens, f"{H}, {W}, {self.num_latent_tokens}"
-        x = z_quantized.reshape(N, C*H, W).permute(0, 2, 1) # NLD
+        assert H == 1 and W == self.num_total_latent_tokens, f"{H}, {W}, {self.num_total_latent_tokens}"
+        x = z_quantized.reshape(N, C*H, W).permute(0, 2, 1) # NLD ; if use semantic latent tokens should be W = L + S
         x = self.decoder_embed(x)
 
         batchsize, seq_len, _ = x.shape
@@ -380,13 +444,38 @@ class TiTokDecoder(nn.Module):
         mask_tokens = torch.cat([_expand_token(self.class_embedding, mask_tokens.shape[0]).to(mask_tokens.dtype),
                                     mask_tokens], dim=1)
         mask_tokens = mask_tokens + self.positional_embedding.to(mask_tokens.dtype)
-        x = x + self.latent_token_positional_embedding[:seq_len]
+
+        if self.num_semantic_latent_tokens > 0:
+            if self.latent_sem_first:
+                s0, s1 = 0, self.num_semantic_latent_tokens # semantic latent first
+                l0, l1 = s1, self.num_total_latent_tokens
+            else:
+                l0, l1 = 0, self.num_latent_tokens # img latent first
+                s0, s1 = l1, self.num_total_latent_tokens
+            x[:, l0:l1] = x[:, l0:l1] + self.latent_img_positional_embedding.to(x.dtype)
+            if self.type_embed_img_dec is not None:
+                x[:, l0:l1] = x[:, l0:l1] + self.type_embed_img_dec.to(x.dtype)
+            x[:, s0:s1] = x[:, s0:s1] + self.latent_sem_positional_embedding.to(x.dtype)
+            if self.type_embed_sem_dec is not None:
+                x[:, s0:s1] = x[:, s0:s1] + self.type_embed_sem_dec.to(x.dtype)
+        else:
+            x = x + self.latent_img_positional_embedding.to(x.dtype)
+        
         x = torch.cat([mask_tokens, x], dim=1)
+
+        attn_mask = _build_attn_mask(
+            x,
+            self.grid_size,
+            self.num_latent_tokens,
+            self.num_semantic_latent_tokens,
+            self.latent_sem_first,
+            self.dec_mask_type,
+        )
         
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # NLD -> LND
         for i in range(self.num_layers):
-            x = self.transformer[i](x)
+            x = self.transformer[i](x, attn_mask=attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_post(x)
 

@@ -717,9 +717,9 @@ def train_one_epoch(config, logger, accelerator,
                     f"cls L2 Loss: {autoencoder_logs['train/semantic_cls_loss']:0.4f} "
                     f"d_weight: {autoencoder_logs['train/d_weight']:0.4f} "
                     f"D_factor: {autoencoder_logs['train/discriminator_factor']:0.4f} "
-                    f"entropy_loss: {autoencoder_logs['train/entropy_loss']:0.4f} "
-                    f"n_reactivate: {autoencoder_logs['train/n_reactivate']:0.4f} "
-                    f"threshold_count: {autoencoder_logs['train/threshold_count']:0.4f} "           
+                    # f"entropy_loss: {autoencoder_logs['train/entropy_loss']:0.4f} "
+                    # f"n_reactivate: {autoencoder_logs['train/n_reactivate']:0.4f} "
+                    # f"threshold_count: {autoencoder_logs['train/threshold_count']:0.4f} "           
                 )
                 logs = {
                     "lr": lr,
