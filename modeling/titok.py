@@ -124,26 +124,6 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
         else:
             raise NotImplementedError
         
-        if self.finetune_decoder:
-            # Freeze encoder/quantizer/latent tokens
-            self.latent_tokens.requires_grad_(False)
-            self.encoder.eval()
-            self.encoder.requires_grad_(False)
-            self.quantize.eval()
-            self.quantize.requires_grad_(False)
-
-            # Include MaskGiT-VQGAN's quantizer and decoder
-            self.pixel_quantize = Pixel_Quantizer(
-                num_embeddings=1024, embedding_dim=256, commitment_cost=0.25)
-            self.pixel_decoder = Pixel_Decoder(OmegaConf.create(
-                {"channel_mult": [1, 1, 2, 2, 4],
-                "num_resolutions": 5,
-                "dropout": 0.0,
-                "hidden_channels": 128,
-                "num_channels": 3,
-                "num_res_blocks": 2,
-                "resolution": 256,
-                "z_channels": 256}))
         
     def _save_pretrained(self, save_directory: Path) -> None:
         """Save weights and config to a local directory."""
