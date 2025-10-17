@@ -112,7 +112,6 @@ def main():
     # If passed along, set the training seed now.
     if config.training.seed is not None:
         set_seed(config.training.seed, device_specific=True)
-        os.environ["PYTHONHASHSEED"] = str(config.training.seed)
 
     # if accelerator.local_process_index == 0:
     #     # download the maskgit-vq tokenizer weight

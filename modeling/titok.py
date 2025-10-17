@@ -74,6 +74,14 @@ class PretrainedTokenizer(nn.Module):
     def decode_tokens(self, codes):
         return self.decode(codes)
 
+def build_mlp(hidden_size, projector_dim, z_dim):
+    return nn.Sequential(
+                nn.Linear(hidden_size, projector_dim),
+                nn.SiLU(),
+                nn.Linear(projector_dim, projector_dim),
+                nn.SiLU(),
+                nn.Linear(projector_dim, z_dim),
+            )
 
 class TiTok(BaseModel, PyTorchModelHubMixin):
     def __init__(self, config):
@@ -108,7 +116,15 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
                 scale * torch.randn(self.num_semantic_latent_tokens, self.encoder.width))
         else:
             self.semantic_latent = None
-
+        
+        self.use_repa_alignment = config.model.vq_model.get("use_repa_alignment", True)
+        if self.use_repa_alignment:
+            self.repa_align_policy = config.model.semantic_encoder.get("repa_align", "repeat")
+            token_size = config.model.vq_model.token_size # latent dim
+            self.dino_dim = config.model.semantic_encoder.get("teacher_dim", 768) # 根据 DINOv2 变体设置
+            repa_proj_dim = config.model.semantic_encoder.get("repa_proj_dim", 2048) 
+            self.repa_mlp = build_mlp(token_size,repa_proj_dim,self.dino_dim)
+           
         # Note: we init the prior model in the same way as the encoder and decoder
         self.apply(self._init_weights)
 
@@ -123,7 +139,7 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
             self.quantize = DiagonalGaussianDistribution
         else:
             raise NotImplementedError
-        
+
         
     def _save_pretrained(self, save_directory: Path) -> None:
         """Save weights and config to a local directory."""
@@ -197,6 +213,47 @@ class TiTok(BaseModel, PyTorchModelHubMixin):
         # decoding
         decoded,cls_reconsturcted = self.decode(z_quantized)
         result_dict["cls_recon"] = cls_reconsturcted
+        # latent repa alignment 
+        if self.use_repa_alignment and self.training and (semantic_token_dict is not None):
+            if self.repa_align_policy != "repeat":
+                raise ValueError(f"Expected repa_align='repeat', got {self.repa_align_policy}")
+
+            if z_quantized.dim() != 4:
+                raise ValueError(f"Expect z_quantized 4D, got {tuple(z_quantized.shape)}")
+
+            B, D, H, W = z_quantized.shape
+            assert H == 1,"only accept fake 2D shape B,D,1,N"
+            z_tokens = z_quantized.permute(0, 3, 1, 2).contiguous().squeeze(3)
+            L = z_tokens.shape[1]
+
+            # mlp project to dino teacher's dim [B, L, C_t]
+            z_proj = self.repa_mlp(z_tokens)
+            z_proj = F.normalize(z_proj, dim=-1, eps=1e-6) # normalize
+            with torch.no_grad():
+                if "x_norm_patchtokens" not in semantic_token_dict:
+                    raise KeyError("semantic_token_dict['x_norm_patchtokens'] is required for REPA alignment.")
+                t = semantic_token_dict["x_norm_patchtokens"]  # [B, N_t, C_t] ususally N_t is 256
+                t = F.normalize(t.to(z_proj.dtype), dim=-1, eps=1e-6)
+
+            Nt, Ct = t.shape[1], t.shape[2]
+            assert Ct == z_proj.shape[2],f"Teacher dim {Ct} != projector out dim {z_proj.shape[2]}"
+
+            # length alignment
+            if Nt >= L:
+                r = (Nt + L - 1) // L
+                z_rep = torch.repeat_interleave(z_proj, repeats=r, dim=1)[:, :Nt, :]  # [B, N_t, C_t]
+            else:
+                # not used：if latent longer than teacher ,we adaptive_avg_pool1d latent to N_t
+                z_rep = F.adaptive_avg_pool1d(z_proj.transpose(1, 2), Nt).transpose(1, 2).contiguous()
+
+            # already normalized
+            cos_per_token = (z_rep * t).sum(dim=-1)       # [B, N_t]
+            repa_loss = - cos_per_token.mean()
+
+            result_dict["repa_loss"]  = repa_loss
+
+        else:
+            result_dict["repa_loss"] = torch.zeros((), device=self.device, dtype=self.dtype)
         return decoded, result_dict
 
 

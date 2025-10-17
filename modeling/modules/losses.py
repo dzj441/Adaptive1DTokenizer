@@ -135,6 +135,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
         self.lecam_ema_decay = loss_config.get("lecam_ema_decay", 0.999)
         self.loss_latent_ce_weight = loss_config.get("loss_latent_ce_weight",0.06)
         self.semantic_cls_weight = loss_config.get("semantic_cls_weight", 0.1)
+        self.repa_loss_weight = loss_config.get("repa_loss_weight",0.1)
 
         self.disc_input_shift = loss_config.get("disc_input_shift", False)
 
@@ -226,6 +227,15 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             else raw_latent_ce
         )
 
+        # repa_loss
+        raw_repa_loss = extra_result_dict.get("repa_loss",None)
+        repa_loss = (
+            reconstruction_loss.new_tensor(0.0)
+            if raw_repa_loss is None
+            else raw_repa_loss
+        )
+        
+
         total_loss = (
             reconstruction_loss
             + self.perceptual_weight * perceptual_loss
@@ -233,6 +243,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             + d_weight * discriminator_factor * generator_loss
             + self.loss_latent_ce_weight * latent_ce_loss
             + self.semantic_cls_weight * semantic_cls_loss
+            + self.repa_loss_weight * repa_loss
         )
         loss_dict = dict(
             total_loss=total_loss.clone().detach(),
@@ -247,6 +258,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             gan_loss=generator_loss.detach(),
             latent_ce_loss=(self.loss_latent_ce_weight * latent_ce_loss).detach(),
             semantic_cls_loss=(self.semantic_cls_weight * semantic_cls_loss).detach(),
+            repa_loss = (self.repa_loss_weight * repa_loss).detach(),
         )
 
         return total_loss, loss_dict
